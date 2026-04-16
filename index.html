@@ -817,39 +817,69 @@ body{
    CREDENTIALS (from Excel — USERID_ORPHAN.xlsx)
    To update: re-export the Excel and update this array.
 ============================================================ */
-var USERS = [{"userid": "NCR.TAURU", "password": "Ncrtauru@246"}, {"userid": "NCR.TAU.FMRTS", "password": "Fmrtstau#135"}, {"userid": "ONE.NCR", "password": "Ncrone*987"}, {"userid": "NCR.BILASPUR", "password": "Ncrbilapsur.009"}];
-
 /* ============================================================
-   Apps Script Web App URL
-   After deploying Apps Script → paste the URL here.
+   CONFIGURATION — paste your URLs here after deploying
 ============================================================ */
-var APPS_SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbx4kmwClQmqP-X10vSScBZdqk1yzUwO1QQvGUuDjMRyRiGugJs37_ahBIWVSDrVdyRS/exec';
+// URL of the Response Recording Apps Script (Code_Response.gs)
+var APPS_SCRIPT_URL  = 'YOUR_RESPONSE_SCRIPT_URL_HERE';
+
+// URL of the Credentials Apps Script (Code_Credentials.gs)
+var CREDS_SCRIPT_URL = 'YOUR_CREDENTIALS_SCRIPT_URL_HERE';
 
 /* ── Auth state ── */
 var loggedInUser = null;
 
 /* ============================================================
-   LOGIN
+   LOGIN  — validates credentials against Google Sheet via
+   Code_Credentials.gs (no credentials stored in this file)
 ============================================================ */
-function loginKeydown(e) { if(e.key==='Enter') doLogin(); }
+function loginKeydown(e) { if (e.key === 'Enter') doLogin(); }
 
 function doLogin() {
-  var uid  = document.getElementById('loginUserId').value.trim();
-  var pass = document.getElementById('loginPassword').value;
+  var uid   = document.getElementById('loginUserId').value.trim();
+  var pass  = document.getElementById('loginPassword').value;
   var errEl = document.getElementById('loginError');
+  var btn   = document.querySelector('.btn-login');
 
-  var match = USERS.find(function(u) {
-    return u.userid === uid && u.password === pass;
-  });
-
-  if (match) {
-    errEl.classList.remove('show');
-    loggedInUser = uid;
-    document.getElementById('loginPage').style.display = 'none';
-    document.getElementById('appPage').style.display   = 'block';
-  } else {
+  if (!uid || !pass) {
+    errEl.textContent = '✖ Please enter both User ID and Password.';
     errEl.classList.add('show');
+    return;
   }
+
+  // Show loading state
+  btn.textContent = 'VERIFYING…';
+  btn.disabled = true;
+  errEl.classList.remove('show');
+
+  fetch(CREDS_SCRIPT_URL, {
+    method:  'POST',
+    headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+    body:    JSON.stringify({ action: 'login', userid: uid, password: pass })
+  })
+  .then(function(res) { return res.text(); })
+  .then(function(text) {
+    btn.textContent = 'LOGIN';
+    btn.disabled = false;
+    var result = {};
+    try { result = JSON.parse(text); } catch(_) { result = { success: false }; }
+
+    if (result.success) {
+      errEl.classList.remove('show');
+      loggedInUser = uid;
+      document.getElementById('loginPage').style.display = 'none';
+      document.getElementById('appPage').style.display   = 'block';
+    } else {
+      errEl.textContent = '✖ ' + (result.error || 'Invalid User ID or Password. Access denied.');
+      errEl.classList.add('show');
+    }
+  })
+  .catch(function(err) {
+    btn.textContent = 'LOGIN';
+    btn.disabled = false;
+    errEl.textContent = '✖ Cannot reach authentication server. Check your internet connection.';
+    errEl.classList.add('show');
+  });
 }
 
 function doLogout() {
@@ -949,21 +979,17 @@ function capturePhoto(e) {
   var canvas = document.getElementById('captureCanvas');
   var ctx    = canvas.getContext('2d');
 
-  // ── Resize to max 800px wide to keep payload small (<200 KB/image) ──
-  var maxW = 800;
-  var srcW = video.videoWidth  || 640;
-  var srcH = video.videoHeight || 480;
-  var scale = srcW > maxW ? maxW / srcW : 1;
-  var w = Math.round(srcW * scale);
-  var h = Math.round(srcH * scale);
+  // ── Full original resolution — no downscaling ──
+  var w = video.videoWidth  || 1280;
+  var h = video.videoHeight || 720;
   canvas.width = w; canvas.height = h;
 
   // Mirror-correct: flip horizontally so saved image is NOT mirrored
   ctx.save(); ctx.translate(w,0); ctx.scale(-1,1);
   ctx.drawImage(video,0,0,w,h); ctx.restore();
 
-  // JPEG at 0.6 quality ≈ 80-150 KB — well within Apps Script limits
-  var dataUrl = canvas.toDataURL('image/jpeg', 0.6);
+  // PNG = lossless, full original quality
+  var dataUrl = canvas.toDataURL('image/png');
   photos[targetSlot] = dataUrl;
 
   var slot  = document.getElementById('slot'+targetSlot);
@@ -1085,10 +1111,9 @@ function onFieldChange() {
 }
 
 /* ============================================================
-   SUBMIT  — two-step: text data first, then photos
-   Step 1 → POST text fields only → row written in Sheet instantly
-   Step 2 → POST photos (JPEG compressed ~150 KB each) → Drive URLs
-            added to same row. Photos upload in background.
+   SUBMIT — Step 1: text fields → Step 2: 3 photos in PARALLEL
+   Popup fires ONCE, only after all steps complete.
+   No duplicate popup, no unexpected form reset.
 ============================================================ */
 function handleSubmit() {
   if (submitting) return;
@@ -1108,7 +1133,7 @@ function handleSubmit() {
   btn.disabled = true;
   btn.innerHTML = '<span class="btn-spinner"></span> SAVING DATA…';
 
-  /* ── STEP 1: send text fields only (tiny payload, always works) ── */
+  /* ── STEP 1: text fields only (lightweight, instant) ── */
   var textPayload = {
     action:     'saveData',
     user:       loggedInUser || '',
@@ -1119,62 +1144,60 @@ function handleSubmit() {
     flyerType:  v.flyerType
   };
 
-  postToScript(textPayload)
+  postToScript(APPS_SCRIPT_URL, textPayload)
     .then(function(result) {
-      if (!result.success) { throw new Error(result.error || 'Step 1 failed'); }
+      if (!result.success) { throw new Error(result.error || 'Data save failed'); }
 
-      var rowIndex = result.row; // Apps Script returns the row number
-      btn.innerHTML = '<span class="btn-spinner"></span> UPLOADING PHOTOS…';
+      var rowIndex = result.row;
+      btn.innerHTML = '<span class="btn-spinner"></span> UPLOADING PHOTOS (1/3)…';
 
-      /* ── STEP 2: send photos (JPEG ~150 KB each, one request) ── */
-      var photoPayload = {
-        action: 'savePhotos',
-        row:    rowIndex,
-        awb:    v.awb,
-        photos: photos   // now JPEG-compressed, ~450 KB total
-      };
-
-      /* Photos upload in background — form resets after text is saved */
-      postToScript(photoPayload)
-        .then(function() {
-          submitting = false;
-          showSubmitPopup();
-        })
-        .catch(function(photoErr) {
-          /* Text data already saved — show success even if photos fail */
-          submitting = false;
-          showSubmitPopup();
-          showToast('info', 'Note', 'Data saved. Photo upload had an issue: ' + photoErr.message);
+      /* ── STEP 2: upload all 3 photos in PARALLEL for speed ── */
+      var photoPromises = photos.map(function(photo, idx) {
+        return postToScript(APPS_SCRIPT_URL, {
+          action:     'savePhoto',      // singular — one photo per request
+          row:        rowIndex,
+          awb:        v.awb,
+          photoIndex: idx,              // 0=Front, 1=Back, 2=Label
+          photo:      photo
+        }).then(function(r) {
+          // Update button progress counter
+          var uploaded = (btn.getAttribute('data-uploaded') | 0) + 1;
+          btn.setAttribute('data-uploaded', uploaded);
+          btn.innerHTML = '<span class="btn-spinner"></span> UPLOADING PHOTOS (' + uploaded + '/3)…';
+          return r;
         });
+      });
 
-      /* Don't wait for photos — show popup after text data confirmed */
+      /* Wait for ALL 3 photo uploads to finish */
+      return Promise.all(photoPromises);
+    })
+    .then(function() {
+      /* ── ALL DONE: show popup ONCE, here, and nowhere else ── */
       submitting = false;
-      showSubmitPopup();
+      showSubmitPopup();          // ← single call, no duplicates
     })
     .catch(function(err) {
       submitting = false;
       btn.disabled = false;
+      btn.setAttribute('data-uploaded', 0);
       btn.innerHTML = '&#11014; &nbsp;SUBMIT SALVAGE RECORD';
-      showToast('error', 'Submission Failed', err.message || 'Could not reach Apps Script. Check the URL in Index.html.');
+      showToast('error', 'Submission Failed', err.message || 'Could not reach server. Check APPS_SCRIPT_URL.');
     });
 }
 
-/* ── helper: POST JSON to Apps Script as text/plain ── */
-function postToScript(payload) {
-  return fetch(APPS_SCRIPT_URL, {
+/* ── helper: POST JSON to an Apps Script URL as text/plain ──
+   Using text/plain avoids CORS preflight — Apps Script receives
+   the body correctly and can parse it as JSON internally.      */
+function postToScript(url, payload) {
+  return fetch(url, {
     method:  'POST',
     headers: { 'Content-Type': 'text/plain;charset=utf-8' },
     body:    JSON.stringify(payload)
   })
-  .then(function(res) {
-    if (!res.ok && res.type !== 'opaque') {
-      throw new Error('HTTP ' + res.status);
-    }
-    return res.text();
-  })
+  .then(function(res) { return res.text(); })
   .then(function(text) {
     try { return JSON.parse(text); }
-    catch (_) { return { success: true }; }
+    catch (_) { return { success: true }; }   // Apps Script redirect = success
   });
 }
 

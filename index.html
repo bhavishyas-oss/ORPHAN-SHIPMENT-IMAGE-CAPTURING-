@@ -823,7 +823,7 @@ var USERS = [{"userid": "NCR.TAURU", "password": "Ncrtauru@246"}, {"userid": "NC
    Apps Script Web App URL
    After deploying Apps Script → paste the URL here.
 ============================================================ */
-var APPS_SCRIPT_URL = 'https://script.google.com/macros/s/YOUR_ID/exec';
+var APPS_SCRIPT_URL = 'YOUR_APPS_SCRIPT_WEB_APP_URL_HERE';
 
 /* ── Auth state ── */
 var loggedInUser = null;
@@ -1104,17 +1104,32 @@ function handleSubmit() {
     user:       loggedInUser||''
   };
 
-  fetch(APPS_SCRIPT_URL,{
-    method:'POST',mode:'no-cors',
-    headers:{'Content-Type':'application/json'},
-    body:JSON.stringify(payload)
+  // NOTE: Content-Type must be 'text/plain' to avoid CORS preflight.
+  // Apps Script reads the body as text and parses it as JSON internally.
+  // Never use mode:'no-cors' — it silently drops the request body.
+  fetch(APPS_SCRIPT_URL, {
+    method:  'POST',
+    headers: { 'Content-Type': 'text/plain' },
+    body:    JSON.stringify(payload)
   })
-  .then(function(){ submitting=false; showSubmitPopup(); })
-  .catch(function(err){
-    submitting=false;
-    btn.disabled=false;
-    btn.innerHTML='&#11014; &nbsp;SUBMIT SALVAGE RECORD';
-    showToast('error','Connection Error',err.message||'Could not reach server.');
+  .then(function(response) { return response.text(); })
+  .then(function(text) {
+    submitting = false;
+    var result = {};
+    try { result = JSON.parse(text); } catch(e) { result = { success: true }; }
+    if (result.success === false) {
+      btn.disabled = false;
+      btn.innerHTML = '&#11014; &nbsp;SUBMIT SALVAGE RECORD';
+      showToast('error', 'Server Error', result.error || 'Submission failed on server.');
+    } else {
+      showSubmitPopup();
+    }
+  })
+  .catch(function(err) {
+    submitting = false;
+    btn.disabled = false;
+    btn.innerHTML = '&#11014; &nbsp;SUBMIT SALVAGE RECORD';
+    showToast('error', 'Connection Error', err.message || 'Cannot reach Apps Script. Check the URL.');
   });
 }
 

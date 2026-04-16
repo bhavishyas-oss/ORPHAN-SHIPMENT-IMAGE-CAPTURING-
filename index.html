@@ -948,12 +948,22 @@ function capturePhoto(e) {
   var video  = document.getElementById('videoFeed');
   var canvas = document.getElementById('captureCanvas');
   var ctx    = canvas.getContext('2d');
-  var w=video.videoWidth, h=video.videoHeight;
-  canvas.width=w; canvas.height=h;
+
+  // ── Resize to max 800px wide to keep payload small (<200 KB/image) ──
+  var maxW = 800;
+  var srcW = video.videoWidth  || 640;
+  var srcH = video.videoHeight || 480;
+  var scale = srcW > maxW ? maxW / srcW : 1;
+  var w = Math.round(srcW * scale);
+  var h = Math.round(srcH * scale);
+  canvas.width = w; canvas.height = h;
+
+  // Mirror-correct: flip horizontally so saved image is NOT mirrored
   ctx.save(); ctx.translate(w,0); ctx.scale(-1,1);
   ctx.drawImage(video,0,0,w,h); ctx.restore();
 
-  var dataUrl = canvas.toDataURL('image/png');
+  // JPEG at 0.6 quality ≈ 80-150 KB — well within Apps Script limits
+  var dataUrl = canvas.toDataURL('image/jpeg', 0.6);
   photos[targetSlot] = dataUrl;
 
   var slot  = document.getElementById('slot'+targetSlot);
@@ -1075,61 +1085,96 @@ function onFieldChange() {
 }
 
 /* ============================================================
-   SUBMIT
+   SUBMIT  — two-step: text data first, then photos
+   Step 1 → POST text fields only → row written in Sheet instantly
+   Step 2 → POST photos (JPEG compressed ~150 KB each) → Drive URLs
+            added to same row. Photos upload in background.
 ============================================================ */
 function handleSubmit() {
-  if(submitting) return;
+  if (submitting) return;
   var v = getFormValues();
-  if(!v.pocName||!v.pocId||!v.expBarcode||!v.awb||!v.flyerType){
-    showToast('error','Incomplete Form','Please fill in all required fields.');
+
+  if (!v.pocName || !v.pocId || !v.expBarcode || !v.awb || !v.flyerType) {
+    showToast('error', 'Incomplete Form', 'Please fill in all required fields.');
     return;
   }
-  if(photos.filter(function(p){return p!==null;}).length<3){
-    showToast('error','Missing Photos','Please capture all 3 photos.');
+  if (photos.filter(function(p){ return p !== null; }).length < 3) {
+    showToast('error', 'Missing Photos', 'Please capture all 3 photos.');
     return;
   }
 
-  submitting=true;
-  var btn=document.getElementById('btnSubmit');
-  btn.disabled=true;
-  btn.innerHTML='<span class="btn-spinner"></span> UPLOADING…';
+  submitting = true;
+  var btn = document.getElementById('btnSubmit');
+  btn.disabled = true;
+  btn.innerHTML = '<span class="btn-spinner"></span> SAVING DATA…';
 
-  var payload={
+  /* ── STEP 1: send text fields only (tiny payload, always works) ── */
+  var textPayload = {
+    action:     'saveData',
+    user:       loggedInUser || '',
     pocName:    v.pocName,
     pocId:      v.pocId,
     expBarcode: v.expBarcode,
     awb:        v.awb,
-    flyerType:  v.flyerType,
-    photos:     photos,
-    user:       loggedInUser||''
+    flyerType:  v.flyerType
   };
 
-  // NOTE: Content-Type must be 'text/plain' to avoid CORS preflight.
-  // Apps Script reads the body as text and parses it as JSON internally.
-  // Never use mode:'no-cors' — it silently drops the request body.
-  fetch(APPS_SCRIPT_URL, {
-    method:  'POST',
-    headers: { 'Content-Type': 'text/plain' },
-    body:    JSON.stringify(payload)
-  })
-  .then(function(response) { return response.text(); })
-  .then(function(text) {
-    submitting = false;
-    var result = {};
-    try { result = JSON.parse(text); } catch(e) { result = { success: true }; }
-    if (result.success === false) {
+  postToScript(textPayload)
+    .then(function(result) {
+      if (!result.success) { throw new Error(result.error || 'Step 1 failed'); }
+
+      var rowIndex = result.row; // Apps Script returns the row number
+      btn.innerHTML = '<span class="btn-spinner"></span> UPLOADING PHOTOS…';
+
+      /* ── STEP 2: send photos (JPEG ~150 KB each, one request) ── */
+      var photoPayload = {
+        action: 'savePhotos',
+        row:    rowIndex,
+        awb:    v.awb,
+        photos: photos   // now JPEG-compressed, ~450 KB total
+      };
+
+      /* Photos upload in background — form resets after text is saved */
+      postToScript(photoPayload)
+        .then(function() {
+          submitting = false;
+          showSubmitPopup();
+        })
+        .catch(function(photoErr) {
+          /* Text data already saved — show success even if photos fail */
+          submitting = false;
+          showSubmitPopup();
+          showToast('info', 'Note', 'Data saved. Photo upload had an issue: ' + photoErr.message);
+        });
+
+      /* Don't wait for photos — show popup after text data confirmed */
+      submitting = false;
+      showSubmitPopup();
+    })
+    .catch(function(err) {
+      submitting = false;
       btn.disabled = false;
       btn.innerHTML = '&#11014; &nbsp;SUBMIT SALVAGE RECORD';
-      showToast('error', 'Server Error', result.error || 'Submission failed on server.');
-    } else {
-      showSubmitPopup();
-    }
+      showToast('error', 'Submission Failed', err.message || 'Could not reach Apps Script. Check the URL in Index.html.');
+    });
+}
+
+/* ── helper: POST JSON to Apps Script as text/plain ── */
+function postToScript(payload) {
+  return fetch(APPS_SCRIPT_URL, {
+    method:  'POST',
+    headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+    body:    JSON.stringify(payload)
   })
-  .catch(function(err) {
-    submitting = false;
-    btn.disabled = false;
-    btn.innerHTML = '&#11014; &nbsp;SUBMIT SALVAGE RECORD';
-    showToast('error', 'Connection Error', err.message || 'Cannot reach Apps Script. Check the URL.');
+  .then(function(res) {
+    if (!res.ok && res.type !== 'opaque') {
+      throw new Error('HTTP ' + res.status);
+    }
+    return res.text();
+  })
+  .then(function(text) {
+    try { return JSON.parse(text); }
+    catch (_) { return { success: true }; }
   });
 }
 

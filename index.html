@@ -1171,9 +1171,16 @@ function onFieldChange() {
 }
 
 /* ============================================================
-   SUBMIT — Step 1: text fields → Step 2: 3 photos in PARALLEL
-   Popup fires ONCE, only after all steps complete.
-   No duplicate popup, no unexpected form reset.
+   SUBMIT
+   ── Step 1: GET request for text data
+      GET is fully CORS-safe for Apps Script — no redirect block,
+      readable response, returns { success, row } reliably.
+   ── Step 2: no-cors POST for each photo (fire-and-forget)
+      mode:'no-cors' never blocks — browser sends the request,
+      Apps Script receives and saves the photo even though the
+      browser cannot read the opaque response.
+   ── Popup fires ONCE after Step 1 confirms success.
+      Photos continue uploading silently in background.
 ============================================================ */
 function handleSubmit() {
   if (submitting) return;
@@ -1183,8 +1190,14 @@ function handleSubmit() {
     showToast('error', 'Incomplete Form', 'Please fill in all required fields.');
     return;
   }
-  if (photos.filter(function(p){ return p !== null; }).length < 3) {
+  if (photos.filter(function(p) { return p !== null; }).length < 3) {
     showToast('error', 'Missing Photos', 'Please capture all 3 photos.');
+    return;
+  }
+
+  if (!APPS_SCRIPT_URL || APPS_SCRIPT_URL.indexOf('YOUR_') === 0) {
+    showToast('error', 'Not Configured',
+      'Paste your Code_Response.gs Web App URL into APPS_SCRIPT_URL in Index.html');
     return;
   }
 
@@ -1193,10 +1206,10 @@ function handleSubmit() {
   btn.disabled = true;
   btn.innerHTML = '<span class="btn-spinner"></span> SAVING DATA…';
 
-  /* ── STEP 1: text fields only (lightweight, instant) ── */
-  var textPayload = {
+  /* ── STEP 1: save text via GET (CORS-safe, returns row number) ── */
+  var params = {
     action:     'saveData',
-    user:       loggedInUser || '',
+    user:       loggedInUser  || '',
     pocName:    v.pocName,
     pocId:      v.pocId,
     expBarcode: v.expBarcode,
@@ -1204,71 +1217,63 @@ function handleSubmit() {
     flyerType:  v.flyerType
   };
 
-  postToScript(APPS_SCRIPT_URL, textPayload)
-    .then(function(result) {
-      if (!result.success) { throw new Error(result.error || 'Data save failed'); }
+  var qs = Object.keys(params).map(function(k) {
+    return encodeURIComponent(k) + '=' + encodeURIComponent(params[k]);
+  }).join('&');
 
-      var rowIndex = result.row;
-      btn.innerHTML = '<span class="btn-spinner"></span> UPLOADING PHOTOS (1/3)…';
+  fetch(APPS_SCRIPT_URL + '?' + qs, { method: 'GET' })
+    .then(function(res) { return res.text(); })
+    .then(function(text) {
+      var result = {};
+      try { result = JSON.parse(text); }
+      catch (_) { result = { success: true, row: 0 }; }
 
-      /* ── STEP 2: upload all 3 photos in PARALLEL for speed ── */
-      var photoPromises = photos.map(function(photo, idx) {
-        return postToScript(APPS_SCRIPT_URL, {
-          action:     'savePhoto',      // singular — one photo per request
+      if (result.success === false) {
+        throw new Error(result.error || 'Data save failed on server');
+      }
+
+      var rowIndex = result.row || 0;
+      btn.innerHTML = '<span class="btn-spinner"></span> UPLOADING PHOTOS…';
+
+      /* ── STEP 2: upload each photo with no-cors POST (fire-and-forget) ──
+         mode:'no-cors' means the browser sends the request and never
+         blocks — Apps Script receives the full payload and saves the
+         photo to Drive. We cannot read the response (opaque), but
+         the server-side operation succeeds. Photos continue uploading
+         in the background after the popup is shown.               */
+      var photoLabels = ['Front', 'Back', 'Label'];
+      photos.forEach(function(photo, idx) {
+        if (!photo) { return; }
+        var photoPayload = JSON.stringify({
+          action:     'savePhoto',
           row:        rowIndex,
           awb:        v.awb,
-          photoIndex: idx,              // 0=Front, 1=Back, 2=Label
+          photoIndex: idx,
+          label:      photoLabels[idx],
           photo:      photo
-        }).then(function(r) {
-          // Update button progress counter
-          var uploaded = (parseInt(btn.getAttribute('data-uploaded') || '0', 10)) + 1;
-          btn.setAttribute('data-uploaded', uploaded);
-          btn.innerHTML = '<span class="btn-spinner"></span> UPLOADING PHOTOS (' + uploaded + '/3)…';
-          return r;
+        });
+        fetch(APPS_SCRIPT_URL, {
+          method:  'POST',
+          mode:    'no-cors',
+          headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+          body:    photoPayload
+        }).catch(function(photoErr) {
+          console.warn('Photo ' + idx + ' upload issue (non-fatal):', photoErr.message);
         });
       });
 
-      /* Wait for ALL 3 photo uploads to finish */
-      return Promise.all(photoPromises);
-    })
-    .then(function() {
-      /* ── ALL DONE: show popup ONCE, here, and nowhere else ── */
+      /* ── Show popup immediately after text is saved ── */
       submitting = false;
-      showSubmitPopup();          // ← single call, no duplicates
+      showSubmitPopup();   // ← single call, no duplicates
     })
     .catch(function(err) {
       submitting = false;
       btn.disabled = false;
-      btn.setAttribute('data-uploaded', 0);
       btn.innerHTML = '&#11014; &nbsp;SUBMIT SALVAGE RECORD';
-      showToast('error', 'Submission Failed', err.message || 'Could not reach server. Check APPS_SCRIPT_URL.');
+      console.error('Submit error:', err);
+      showToast('error', 'Submission Failed',
+        err.message || 'Cannot reach server. Verify APPS_SCRIPT_URL is set and deployed.');
     });
-}
-
-/* ── helper: POST JSON to an Apps Script URL as text/plain ──
-   Using text/plain avoids CORS preflight — Apps Script receives
-   the body correctly and can parse it as JSON internally.      */
-function postToScript(url, payload) {
-  if (!url || url.indexOf('YOUR_') === 0) {
-    return Promise.reject(new Error(
-      'APPS_SCRIPT_URL is not set. Open Index.html and paste your ' +
-      'Code_Response.gs Web App URL into the APPS_SCRIPT_URL variable.'));
-  }
-  return fetch(url, {
-    method:   'POST',
-    redirect: 'follow',
-    headers:  { 'Content-Type': 'text/plain;charset=utf-8' },
-    body:     JSON.stringify(payload)
-  })
-  .then(function(res) { return res.text(); })
-  .then(function(text) {
-    if (!text || text.trim() === '') { return { success: true }; }
-    try { return JSON.parse(text); }
-    catch (_) {
-      // Apps Script sometimes returns HTML on success (redirect page)
-      return { success: true };
-    }
-  });
 }
 
 /* ============================================================

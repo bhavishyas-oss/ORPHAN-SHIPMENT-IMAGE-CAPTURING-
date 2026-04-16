@@ -818,20 +818,25 @@ body{
    To update: re-export the Excel and update this array.
 ============================================================ */
 /* ============================================================
-   CONFIGURATION — paste your URLs here after deploying
+   CONFIGURATION
+   ─ APPS_SCRIPT_URL : paste your Code_Response.gs Web App URL
+   ─ CREDS_SHEET_ID  : the ID portion of your credentials Sheet URL
+     e.g. https://docs.google.com/spreadsheets/d/ <<THIS>> /edit
+   The credentials sheet must be shared as
+   "Anyone with the link → Viewer" for direct read to work.
 ============================================================ */
-// URL of the Response Recording Apps Script (Code_Response.gs)
-var APPS_SCRIPT_URL  = 'https://script.google.com/u/0/home/projects/1S-WncilXXtzahaiwFrR5hoz96DTFzSblAWYPi-_J6484McnsE3XVzZmt/edit';
-
-// URL of the Credentials Apps Script (Code_Credentials.gs)
-var CREDS_SCRIPT_URL = 'https://script.google.com/u/0/home/projects/1ey9bJdeh6CNrW3jA-dtzv62v-sbRc73-5UMkjaNiddzRvJxtLIFwyiOP/edit';
+var APPS_SCRIPT_URL = 'https://script.google.com/u/0/home/projects/1S-WncilXXtzahaiwFrR5hoz96DTFzSblAWYPi-_J6484McnsE3XVzZmt/edit';
+var CREDS_SHEET_ID  = '1139mNsQJRa2QFAJvgY2MMVm9QbozDjYI93tO8gPpyNc';
 
 /* ── Auth state ── */
-var loggedInUser = null;
+var loggedInUser     = null;
+var _credsCache      = null;   // cached credentials after first load
 
 /* ============================================================
-   LOGIN  — validates credentials against Google Sheet via
-   Code_Credentials.gs (no credentials stored in this file)
+   LOGIN — reads credentials directly from Google Sheet via
+   the gviz/tq CSV endpoint. No Apps Script deployment needed.
+   Requires: credentials Sheet shared as "Anyone can view".
+   Column A = userid, Column B = password (row 1 = headers).
 ============================================================ */
 function loginKeydown(e) { if (e.key === 'Enter') doLogin(); }
 
@@ -842,44 +847,99 @@ function doLogin() {
   var btn   = document.querySelector('.btn-login');
 
   if (!uid || !pass) {
-    errEl.textContent = '✖ Please enter both User ID and Password.';
-    errEl.classList.add('show');
+    _showLoginError(errEl, 'Please enter both User ID and Password.');
     return;
   }
 
-  // Show loading state
   btn.textContent = 'VERIFYING…';
-  btn.disabled = true;
+  btn.disabled    = true;
   errEl.classList.remove('show');
 
-  fetch(CREDS_SCRIPT_URL, {
-    method:  'POST',
-    headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-    body:    JSON.stringify({ action: 'login', userid: uid, password: pass })
-  })
-  .then(function(res) { return res.text(); })
-  .then(function(text) {
-    btn.textContent = 'LOGIN';
-    btn.disabled = false;
-    var result = {};
-    try { result = JSON.parse(text); } catch(_) { result = { success: false }; }
+  _loadCredentials()
+    .then(function(creds) {
+      btn.textContent = 'LOGIN';
+      btn.disabled    = false;
 
-    if (result.success) {
-      errEl.classList.remove('show');
-      loggedInUser = uid;
-      document.getElementById('loginPage').style.display = 'none';
-      document.getElementById('appPage').style.display   = 'block';
+      // Case-insensitive userid, exact password
+      var match = creds.find(function(row) {
+        return row.userid.trim().toLowerCase() === uid.toLowerCase() &&
+               row.password.trim() === pass;
+      });
+
+      if (match) {
+        errEl.classList.remove('show');
+        loggedInUser = uid.toUpperCase();
+        document.getElementById('loginPage').style.display = 'none';
+        document.getElementById('appPage').style.display   = 'block';
+      } else {
+        _showLoginError(errEl, 'Invalid User ID or Password. Access denied.');
+      }
+    })
+    .catch(function(err) {
+      btn.textContent = 'LOGIN';
+      btn.disabled    = false;
+      console.error('Login fetch error:', err);
+      _showLoginError(errEl,
+        'Could not load credentials. Ensure the credentials sheet is shared as ' +
+        '"Anyone with the link → Viewer" and your internet is active.');
+    });
+}
+
+/* Load credentials from the Google Sheet (cached after first call) */
+function _loadCredentials() {
+  if (_credsCache) { return Promise.resolve(_credsCache); }
+
+  // gviz/tq with tqx=out:csv returns plain CSV — full CORS support,
+  // no Apps Script deployment required, no OAuth needed.
+  var url = 'https://docs.google.com/spreadsheets/d/' + CREDS_SHEET_ID +
+            '/gviz/tq?tqx=out:csv&sheet=Sheet1';
+
+  return fetch(url, { cache: 'no-store' })
+    .then(function(res) {
+      if (!res.ok) { throw new Error('HTTP ' + res.status + ' — check sheet sharing settings'); }
+      return res.text();
+    })
+    .then(function(csv) {
+      var lines = csv.trim().split('\n');
+      var creds = [];
+      // Skip row 0 (header). Parse each subsequent row.
+      for (var i = 1; i < lines.length; i++) {
+        var cols = _parseCSVRow(lines[i]);
+        if (cols.length >= 2 && cols[0]) {
+          creds.push({ userid: cols[0], password: cols[1] });
+        }
+      }
+      if (creds.length === 0) {
+        throw new Error('No users found in credentials sheet (check column order: A=userid, B=password)');
+      }
+      _credsCache = creds;   // cache so subsequent logins are instant
+      return creds;
+    });
+}
+
+/* Minimal RFC-4180 CSV row parser — handles quoted fields */
+function _parseCSVRow(row) {
+  var result = [];
+  var cur = '';
+  var inQ  = false;
+  for (var i = 0; i < row.length; i++) {
+    var c = row[i];
+    if (c === '"') {
+      if (inQ && row[i+1] === '"') { cur += '"'; i++; }   // escaped quote
+      else { inQ = !inQ; }
+    } else if (c === ',' && !inQ) {
+      result.push(cur); cur = ''; inQ = false;
     } else {
-      errEl.textContent = '✖ ' + (result.error || 'Invalid User ID or Password. Access denied.');
-      errEl.classList.add('show');
+      cur += c;
     }
-  })
-  .catch(function(err) {
-    btn.textContent = 'LOGIN';
-    btn.disabled = false;
-    errEl.textContent = '✖ Cannot reach authentication server. Check your internet connection.';
-    errEl.classList.add('show');
-  });
+  }
+  result.push(cur);
+  return result;
+}
+
+function _showLoginError(el, msg) {
+  el.textContent = '\u2716 ' + msg;
+  el.classList.add('show');
 }
 
 function doLogout() {
@@ -1161,7 +1221,7 @@ function handleSubmit() {
           photo:      photo
         }).then(function(r) {
           // Update button progress counter
-          var uploaded = (btn.getAttribute('data-uploaded') | 0) + 1;
+          var uploaded = (parseInt(btn.getAttribute('data-uploaded') || '0', 10)) + 1;
           btn.setAttribute('data-uploaded', uploaded);
           btn.innerHTML = '<span class="btn-spinner"></span> UPLOADING PHOTOS (' + uploaded + '/3)…';
           return r;
@@ -1189,15 +1249,25 @@ function handleSubmit() {
    Using text/plain avoids CORS preflight — Apps Script receives
    the body correctly and can parse it as JSON internally.      */
 function postToScript(url, payload) {
+  if (!url || url.indexOf('YOUR_') === 0) {
+    return Promise.reject(new Error(
+      'APPS_SCRIPT_URL is not set. Open Index.html and paste your ' +
+      'Code_Response.gs Web App URL into the APPS_SCRIPT_URL variable.'));
+  }
   return fetch(url, {
-    method:  'POST',
-    headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-    body:    JSON.stringify(payload)
+    method:   'POST',
+    redirect: 'follow',
+    headers:  { 'Content-Type': 'text/plain;charset=utf-8' },
+    body:     JSON.stringify(payload)
   })
   .then(function(res) { return res.text(); })
   .then(function(text) {
+    if (!text || text.trim() === '') { return { success: true }; }
     try { return JSON.parse(text); }
-    catch (_) { return { success: true }; }   // Apps Script redirect = success
+    catch (_) {
+      // Apps Script sometimes returns HTML on success (redirect page)
+      return { success: true };
+    }
   });
 }
 

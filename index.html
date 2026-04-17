@@ -567,6 +567,53 @@ body{
 .btn-new:hover{background:var(--accent-dim);}
 .canvas-hidden{display:none;}
 .divider{height:1px;background:var(--border);margin:14px 0;}
+/* ── BLUR WARNING POPUP ── */
+#blurPopup{
+  display:none;position:fixed;inset:0;z-index:10001;
+  background:rgba(0,0,0,.72);backdrop-filter:blur(7px);
+  align-items:center;justify-content:center;
+}
+#blurPopup.show{display:flex;}
+.blur-card{
+  background:var(--glass);
+  border:2px solid rgba(239,68,68,.55);
+  border-radius:var(--r-lg);padding:38px 34px;text-align:center;
+  box-shadow:0 12px 50px rgba(0,0,0,.55);
+  animation:popIn .35s cubic-bezier(.34,1.56,.64,1) forwards;
+  max-width:400px;width:92%;
+}
+.blur-icon{font-size:3rem;margin-bottom:12px;display:block;}
+.blur-title{
+  font-family:'Rajdhani',sans-serif;font-weight:700;
+  font-size:1.55rem;letter-spacing:2.5px;
+  color:#ff7070;text-transform:uppercase;margin-bottom:8px;
+}
+.blur-body{
+  font-family:'Inter',sans-serif;font-size:.88rem;
+  color:rgba(255,255,255,.75);line-height:1.6;margin-bottom:22px;
+}
+.blur-body strong{color:var(--accent);}
+.blur-score{
+  font-family:'JetBrains Mono',monospace;font-size:.7rem;
+  color:rgba(255,255,255,.35);letter-spacing:1px;margin-bottom:20px;
+}
+.btn-retake{
+  width:100%;padding:13px 20px;background:#e74c3c;
+  border:none;border-radius:var(--r-sm);color:#fff;
+  font-family:'Rajdhani',sans-serif;font-weight:700;
+  font-size:1rem;letter-spacing:2.5px;text-transform:uppercase;
+  cursor:pointer;transition:opacity .2s;
+  box-shadow:0 3px 14px rgba(231,76,60,.4);
+}
+.btn-retake:hover{opacity:.88;}
+.btn-use-anyway{
+  display:block;margin-top:10px;
+  font-family:'Inter',sans-serif;font-size:.78rem;
+  color:rgba(255,255,255,.38);cursor:pointer;
+  background:none;border:none;padding:6px;
+  text-decoration:underline;
+}
+.btn-use-anyway:hover{color:rgba(255,255,255,.6);}
 </style>
 </head>
 <body>
@@ -812,6 +859,22 @@ body{
   </div>
 </div>
 
+<!-- BLUR WARNING POPUP (label image clarity check) -->
+<div id="blurPopup">
+  <div class="blur-card">
+    <span class="blur-icon">&#9888;&#65039;</span>
+    <div class="blur-title">UNCLEAR LABEL IMAGE</div>
+    <div class="blur-body">
+      The captured label image appears <strong>blurry or low quality</strong>.<br/>
+      Ensure the label text is clearly visible and in focus before submitting.<br/><br/>
+      Please <strong>retake the label photo</strong>.
+    </div>
+    <div class="blur-score" id="blurScoreInfo"></div>
+    <button class="btn-retake" onclick="retakeLabelPhoto()">&#128247; RETAKE LABEL PHOTO</button>
+    <button class="btn-use-anyway" onclick="useImageAnyway()">Use this image anyway</button>
+  </div>
+</div>
+
 <script>
 /* ============================================================
    CREDENTIALS (from Excel — USERID_ORPHAN.xlsx)
@@ -1039,17 +1102,52 @@ function capturePhoto(e) {
   var canvas = document.getElementById('captureCanvas');
   var ctx    = canvas.getContext('2d');
 
-  // ── Full original resolution — no downscaling ──
+  // ── Full original resolution — no downscaling, no compression ──
   var w = video.videoWidth  || 1280;
   var h = video.videoHeight || 720;
-  canvas.width = w; canvas.height = h;
+  canvas.width  = w;
+  canvas.height = h;
 
   // Mirror-correct: flip horizontally so saved image is NOT mirrored
   ctx.save(); ctx.translate(w,0); ctx.scale(-1,1);
   ctx.drawImage(video,0,0,w,h); ctx.restore();
 
-  // PNG = lossless, full original quality
+  // PNG = lossless full original quality — no toDataURL quality param
   var dataUrl = canvas.toDataURL('image/png');
+
+  // ── Label clarity check (slot 2 only) ──
+  // Runs asynchronously so it never stalls the UI thread.
+  if (targetSlot === 2) {
+    var score = _computeBlurScore(canvas, ctx, w, h);
+    // Threshold: <80 = blurry (typical clear label scores 120-600+)
+    if (score < 80) {
+      // Store tentatively so retake can clear it properly
+      photos[targetSlot] = dataUrl;
+      _pendingBlurSlot    = targetSlot;
+      _pendingBlurDataUrl = dataUrl;
+
+      // Update thumbnail to show what was captured
+      var slot2  = document.getElementById('slot'+targetSlot);
+      var thumb2 = document.getElementById('thumb'+targetSlot);
+      thumb2.src = dataUrl;
+      slot2.classList.remove('pending','active-slot');
+      slot2.classList.add('done');
+
+      // Show blur warning popup
+      document.getElementById('blurScoreInfo').textContent =
+        'Clarity score: ' + Math.round(score) + ' / 80 minimum required';
+      document.getElementById('blurPopup').classList.add('show');
+
+      // Flash feedback
+      var flash2 = document.getElementById('flashOverlay');
+      flash2.classList.remove('go'); void flash2.offsetWidth; flash2.classList.add('go');
+
+      onFieldChange();
+      return;  // halt normal flow; user must retake or confirm
+    }
+  }
+
+  // ── Normal flow (no blur issue) ──
   photos[targetSlot] = dataUrl;
 
   var slot  = document.getElementById('slot'+targetSlot);
@@ -1068,7 +1166,6 @@ function capturePhoto(e) {
   onFieldChange();
 
   if(photos.filter(function(p){return p===null;}).length===0) {
-    /* All captured */
     stopCamera();
     var stage = document.getElementById('photoStage');
     stage.classList.remove('active'); stage.classList.add('success');
@@ -1076,7 +1173,6 @@ function capturePhoto(e) {
     document.getElementById('cameraHint').innerHTML='All 3 photos captured <b>&#10003;</b>';
     showToast('success','All Photos Captured','Front, Back, and Label are ready.');
   } else {
-    /* More to go — find and highlight next empty */
     for(var k=0;k<3;k++){
       if(photos[k]===null){
         document.getElementById('slot'+k).classList.add('active-slot');
@@ -1085,6 +1181,106 @@ function capturePhoto(e) {
     }
     updateStepUI();
     showToast('info','Photo Captured',STEP_LABELS[targetSlot]+' saved. Capture next: '+STEP_DISPLAY[currentStep]);
+  }
+}
+
+/* ============================================================
+   BLUR DETECTION — Laplacian variance (Tenengrad method)
+   Runs in ~5ms on a 150×150 sample; does NOT affect image storage.
+   Score interpretation:
+     < 40   = very blurry  (shaking / out of focus)
+     40–80  = blurry       (marginal, warn user)
+     80–200 = acceptable
+     200+   = sharp / clear
+============================================================ */
+var _pendingBlurSlot    = -1;
+var _pendingBlurDataUrl = null;
+
+function _computeBlurScore(srcCanvas, srcCtx, srcW, srcH) {
+  // Work on a 150×150 thumbnail for speed — only sampling, not storing
+  var SZ  = 150;
+  var tmp = document.createElement('canvas');
+  tmp.width  = SZ;
+  tmp.height = SZ;
+  var tc  = tmp.getContext('2d');
+  tc.drawImage(srcCanvas, 0, 0, srcW, srcH, 0, 0, SZ, SZ);
+
+  var imgData = tc.getImageData(0, 0, SZ, SZ).data;
+  var W = SZ, H = SZ;
+
+  // Convert to grayscale
+  var gray = new Float32Array(W * H);
+  for (var p = 0; p < W * H; p++) {
+    gray[p] = 0.299 * imgData[p*4] + 0.587 * imgData[p*4+1] + 0.114 * imgData[p*4+2];
+  }
+
+  // Apply Laplacian kernel: [0,1,0, 1,-4,1, 0,1,0]
+  var sum = 0, sum2 = 0, n = 0;
+  for (var y = 1; y < H-1; y++) {
+    for (var x = 1; x < W-1; x++) {
+      var lap = gray[(y-1)*W+x] + gray[(y+1)*W+x] +
+                gray[y*W+(x-1)] + gray[y*W+(x+1)] -
+                4 * gray[y*W+x];
+      sum  += lap;
+      sum2 += lap * lap;
+      n++;
+    }
+  }
+
+  // Variance of Laplacian = sharpness score
+  var mean     = sum / n;
+  var variance = (sum2 / n) - (mean * mean);
+  return Math.max(0, variance);
+}
+
+/* User clicks "RETAKE LABEL PHOTO" */
+function retakeLabelPhoto() {
+  document.getElementById('blurPopup').classList.remove('show');
+
+  // Clear the pending blurry photo from slot 2
+  if (_pendingBlurSlot >= 0) {
+    photos[_pendingBlurSlot] = null;
+    var s = document.getElementById('slot'+_pendingBlurSlot);
+    var t = document.getElementById('thumb'+_pendingBlurSlot);
+    s.classList.remove('done','active-slot');
+    s.classList.add('pending','active-slot');
+    t.src = '';
+  }
+  _pendingBlurSlot    = -1;
+  _pendingBlurDataUrl = null;
+
+  // Reset camera so user can recapture
+  var stage = document.getElementById('photoStage');
+  stage.classList.remove('success','active');
+  document.getElementById('allDoneOverlay').classList.remove('show');
+  document.getElementById('stagePlaceholder').style.display = '';
+  document.getElementById('videoFeed').srcObject = null;
+  stopCamera();
+
+  currentStep = 2;  // back to label step
+  updateStepUI();
+  onFieldChange();
+  showToast('info', 'Retake Label', 'Click the camera area to recapture the label.');
+}
+
+/* User clicks "Use this image anyway" */
+function useImageAnyway() {
+  document.getElementById('blurPopup').classList.remove('show');
+  _pendingBlurSlot    = -1;
+  _pendingBlurDataUrl = null;
+
+  // Advance currentStep past label (slot 2 is already set)
+  currentStep = 0;
+  for(var j=0;j<3;j++){ if(photos[j]===null){currentStep=j;break;} if(j===2){currentStep=3;} }
+  onFieldChange();
+
+  if(photos.filter(function(p){return p===null;}).length===0) {
+    stopCamera();
+    var stage = document.getElementById('photoStage');
+    stage.classList.remove('active'); stage.classList.add('success');
+    document.getElementById('allDoneOverlay').classList.add('show');
+    document.getElementById('cameraHint').innerHTML='All 3 photos captured <b>&#10003;</b>';
+    showToast('info','Image Accepted','Label accepted. You may now submit.');
   }
 }
 

@@ -1115,35 +1115,41 @@ function capturePhoto(e) {
   // PNG = lossless full original quality — no toDataURL quality param
   var dataUrl = canvas.toDataURL('image/png');
 
-  // ── Label clarity check (slot 2 only) ──
-  // Runs asynchronously so it never stalls the UI thread.
+  // ── Label clarity check (slot 2 = LABEL only) ──
+  // Wrapped in try/catch so ANY error inside the check cannot
+  // prevent the photo from being saved or the flow from continuing.
   if (targetSlot === 2) {
-    var score = _computeBlurScore(canvas, ctx, w, h);
-    // Threshold: <80 = blurry (typical clear label scores 120-600+)
-    if (score < 80) {
-      // Store tentatively so retake can clear it properly
-      photos[targetSlot] = dataUrl;
-      _pendingBlurSlot    = targetSlot;
-      _pendingBlurDataUrl = dataUrl;
+    try {
+      // score >= 0  → analysis succeeded
+      // score = -1  → analysis failed (canvas taint) → skip check
+      var score = _computeBlurScore(canvas, w, h);
 
-      // Update thumbnail to show what was captured
-      var slot2  = document.getElementById('slot'+targetSlot);
-      var thumb2 = document.getElementById('thumb'+targetSlot);
-      thumb2.src = dataUrl;
-      slot2.classList.remove('pending','active-slot');
-      slot2.classList.add('done');
+      if (score >= 0 && score < 500) {
+        // ── BLURRY: store tentatively, show popup, block submit ──
+        photos[targetSlot] = dataUrl;
+        _pendingBlurSlot    = targetSlot;
+        _pendingBlurDataUrl = dataUrl;
 
-      // Show blur warning popup
-      document.getElementById('blurScoreInfo').textContent =
-        'Clarity score: ' + Math.round(score) + ' / 80 minimum required';
-      document.getElementById('blurPopup').classList.add('show');
+        var slot2  = document.getElementById('slot'+targetSlot);
+        var thumb2 = document.getElementById('thumb'+targetSlot);
+        thumb2.src = dataUrl;
+        slot2.classList.remove('pending','active-slot');
+        slot2.classList.add('done');
 
-      // Flash feedback
-      var flash2 = document.getElementById('flashOverlay');
-      flash2.classList.remove('go'); void flash2.offsetWidth; flash2.classList.add('go');
+        var flash2 = document.getElementById('flashOverlay');
+        flash2.classList.remove('go'); void flash2.offsetWidth; flash2.classList.add('go');
 
-      onFieldChange();
-      return;  // halt normal flow; user must retake or confirm
+        document.getElementById('blurScoreInfo').textContent =
+          'Clarity score: ' + Math.round(score) + ' — minimum required: 500';
+        document.getElementById('blurPopup').classList.add('show');
+
+        onFieldChange();
+        return;   // halt normal flow — user must retake or accept
+      }
+      // score >= 500 → sharp image, fall through to normal flow below
+    } catch (blurErr) {
+      // Safety net: if anything in the check throws, log and continue normally
+      console.error('[BlurCheck] Unexpected error in capturePhoto blur check:', blurErr);
     }
   }
 
@@ -1185,52 +1191,75 @@ function capturePhoto(e) {
 }
 
 /* ============================================================
-   BLUR DETECTION — Laplacian variance (Tenengrad method)
-   Runs in ~5ms on a 150×150 sample; does NOT affect image storage.
-   Score interpretation:
-     < 40   = very blurry  (shaking / out of focus)
-     40–80  = blurry       (marginal, warn user)
-     80–200 = acceptable
-     200+   = sharp / clear
+   BLUR DETECTION — Laplacian variance  (3×3 full kernel)
+   Runs in <5ms on 120×120 sample; NEVER touches the stored image.
+
+   Kernel used: [-1,-1,-1,  -1, 8,-1,  -1,-1,-1]
+   (8-connected — 2× more sensitive than 4-neighbour kernel)
+
+   Score reference for real phone camera images (120×120 sample):
+     < 150  = very blurry / shaking     → popup + must retake
+     150–500 = blurry / soft focus      → popup + warn
+     500+   = acceptable / sharp        → accepted silently
+
+   Returns -1 if analysis fails (canvas taint / SecurityError).
+   A return of -1 is treated as "skip check — accept image".
 ============================================================ */
 var _pendingBlurSlot    = -1;
 var _pendingBlurDataUrl = null;
 
-function _computeBlurScore(srcCanvas, srcCtx, srcW, srcH) {
-  // Work on a 150×150 thumbnail for speed — only sampling, not storing
-  var SZ  = 150;
-  var tmp = document.createElement('canvas');
-  tmp.width  = SZ;
-  tmp.height = SZ;
-  var tc  = tmp.getContext('2d');
-  tc.drawImage(srcCanvas, 0, 0, srcW, srcH, 0, 0, SZ, SZ);
+function _computeBlurScore(srcCanvas, srcW, srcH) {
+  var SZ = 120;
+  try {
+    // Create a fresh off-screen canvas at reduced size (analysis only)
+    var tmp = document.createElement('canvas');
+    tmp.width  = SZ;
+    tmp.height = SZ;
+    var tc = tmp.getContext('2d');
 
-  var imgData = tc.getImageData(0, 0, SZ, SZ).data;
-  var W = SZ, H = SZ;
+    // Draw downsampled copy from the captured canvas (original unchanged)
+    tc.drawImage(srcCanvas, 0, 0, srcW, srcH, 0, 0, SZ, SZ);
 
-  // Convert to grayscale
-  var gray = new Float32Array(W * H);
-  for (var p = 0; p < W * H; p++) {
-    gray[p] = 0.299 * imgData[p*4] + 0.587 * imgData[p*4+1] + 0.114 * imgData[p*4+2];
-  }
+    // getImageData can throw SecurityError if canvas is cross-origin tainted.
+    // Camera streams are same-origin so this rarely happens, but we guard it.
+    var imgData = tc.getImageData(0, 0, SZ, SZ).data;
 
-  // Apply Laplacian kernel: [0,1,0, 1,-4,1, 0,1,0]
-  var sum = 0, sum2 = 0, n = 0;
-  for (var y = 1; y < H-1; y++) {
-    for (var x = 1; x < W-1; x++) {
-      var lap = gray[(y-1)*W+x] + gray[(y+1)*W+x] +
-                gray[y*W+(x-1)] + gray[y*W+(x+1)] -
-                4 * gray[y*W+x];
-      sum  += lap;
-      sum2 += lap * lap;
-      n++;
+    // Convert RGBA → grayscale (ITU-R BT.601 coefficients)
+    var W = SZ, H = SZ, total = W * H;
+    var gray = new Float32Array(total);
+    for (var p = 0; p < total; p++) {
+      gray[p] = 0.299 * imgData[p * 4]
+              + 0.587 * imgData[p * 4 + 1]
+              + 0.114 * imgData[p * 4 + 2];
     }
-  }
 
-  // Variance of Laplacian = sharpness score
-  var mean     = sum / n;
-  var variance = (sum2 / n) - (mean * mean);
-  return Math.max(0, variance);
+    // Apply full 3×3 Laplacian kernel: [-1,-1,-1, -1,8,-1, -1,-1,-1]
+    // This detects edges in ALL directions — far more sensitive than 4-neighbour.
+    var sum2 = 0, count = 0;
+    for (var y = 1; y < H - 1; y++) {
+      for (var x = 1; x < W - 1; x++) {
+        var c   = y * W + x;
+        var lap = -gray[c - W - 1] - gray[c - W] - gray[c - W + 1]
+                  - gray[c     - 1] + 8 * gray[c] - gray[c     + 1]
+                  - gray[c + W - 1] - gray[c + W] - gray[c + W + 1];
+        sum2 += lap * lap;
+        count++;
+      }
+    }
+
+    // Mean of squared Laplacian = sharpness score (higher = sharper)
+    var score = count > 0 ? sum2 / count : 0;
+
+    // Always log so threshold can be calibrated from browser console
+    console.log('[BlurCheck] Label clarity score: ' + score.toFixed(1) +
+                ' | threshold: 500 | ' + (score < 500 ? 'BLURRY ⚠' : 'OK ✓'));
+    return score;
+
+  } catch (err) {
+    // Canvas taint or other error — skip check, accept image
+    console.warn('[BlurCheck] Analysis failed (canvas may be tainted):', err.message);
+    return -1;  // -1 = analysis unavailable → accept image
+  }
 }
 
 /* User clicks "RETAKE LABEL PHOTO" */

@@ -460,6 +460,52 @@ body{
 }
 .camera-hint b{color:var(--accent);font-weight:500;}
 
+/* ── CLICK-TO-FOCUS RING ── */
+.focus-ring{
+  position:absolute;
+  width:64px;height:64px;
+  border:2px solid var(--accent);
+  border-radius:var(--r-sm);
+  box-shadow:0 0 0 1px rgba(0,0,0,.5), inset 0 0 0 1px rgba(0,0,0,.3);
+  pointer-events:none;
+  display:none;
+  z-index:15;
+  transform:translate(-50%,-50%);
+  animation:focusRingPop .25s cubic-bezier(.34,1.56,.64,1) forwards;
+}
+.focus-ring.locking{
+  border-color:#34d399;
+  box-shadow:0 0 12px rgba(52,211,153,.5), inset 0 0 0 1px rgba(0,0,0,.3);
+}
+.focus-ring.locked{
+  border-color:#34d399;
+  width:48px;height:48px;
+  box-shadow:0 0 8px rgba(52,211,153,.35);
+  animation:none;
+}
+.focus-ring.show{display:block;}
+@keyframes focusRingPop{
+  0%{opacity:0;width:88px;height:88px;}
+  100%{opacity:1;width:64px;height:64px;}
+}
+/* Corner brackets inside the focus ring */
+.focus-ring::before,.focus-ring::after{
+  content:'';position:absolute;
+  width:10px;height:10px;
+  border-color:var(--accent);border-style:solid;
+}
+.focus-ring::before{top:-2px;left:-2px;border-width:2px 0 0 2px;}
+.focus-ring::after{bottom:-2px;right:-2px;border-width:0 2px 2px 0;}
+/* Focus-mode hint line */
+.focus-hint-bar{
+  position:absolute;top:8px;right:8px;
+  font-family:'JetBrains Mono',monospace;font-size:.58rem;
+  color:rgba(255,255,255,.55);letter-spacing:1px;
+  background:rgba(0,0,0,.5);padding:3px 7px;border-radius:4px;
+  pointer-events:none;display:none;z-index:14;
+}
+.photo-stage.active .focus-hint-bar{display:block;}
+
 /* ── TOAST ── */
 .toast-container{
   position:fixed;top:20px;right:20px;z-index:9999;
@@ -770,13 +816,17 @@ body{
         </div>
 
         <!-- Photo Stage -->
-        <div class="photo-stage" id="photoStage" onclick="stageClicked()">
+        <div class="photo-stage" id="photoStage" onclick="stageClicked(event)">
           <div class="stage-placeholder" id="stagePlaceholder">
             <div class="ph-icon">&#128247;</div>
             <div class="ph-text">CLICK TO ACTIVATE CAMERA</div>
             <div class="ph-sub">3 PHOTOS REQUIRED — FRONT &middot; BACK &middot; LABEL</div>
           </div>
           <div class="step-indicator" id="stepChip">STEP 1 / 3 — FRONT</div>
+          <!-- Click-to-focus visual indicator -->
+          <div class="focus-ring" id="focusRing"></div>
+          <!-- Focus mode hint -->
+          <div class="focus-hint-bar" id="focusHintBar">TAP TO FOCUS</div>
           <video id="videoFeed" autoplay playsinline></video>
           <div class="capture-overlay">
             <button class="btn-capture" onclick="capturePhoto(event)">&#9679; CAPTURE</button>
@@ -1052,38 +1102,172 @@ var STEP_LABELS  = ['FRONT','BACK','LABEL'];
 var STEP_DISPLAY = ['FRONT PHOTO','BACK PHOTO','SHIPMENT LABEL'];
 
 /* ============================================================
-   CAMERA
+   CAMERA + CLICK-TO-FOCUS
 ============================================================ */
-function stageClicked() {
-  /* If all done and none deleted, ignore */
+var _imageCapture    = null;   // ImageCapture instance (if supported)
+var _focusSupported  = false;  // whether the browser/device supports pointsOfInterest
+var _focusTimer      = null;   // debounce timer for focus ring "locked" state
+
+function stageClicked(evt) {
+  /* All photos done — ignore stage clicks */
   if (currentStep >= 3 && photos.filter(function(p){return p===null;}).length===0) return;
-  if (stream) return;
-  startCamera();
+
+  if (!stream) {
+    /* Camera not yet running — start it */
+    startCamera();
+    return;
+  }
+
+  /* Camera is running — treat click as a focus-point selection */
+  if (evt && evt.target) {
+    var stageEl = document.getElementById('photoStage');
+    /* Ignore clicks that originate from the Capture button or its children */
+    if (evt.target.closest && evt.target.closest('.capture-overlay')) return;
+    _selectFocusPoint(evt, stageEl);
+  }
 }
 
 function startCamera() {
-  var c = {video:{facingMode:'environment',width:{ideal:1280},height:{ideal:1280}}};
-  navigator.mediaDevices.getUserMedia(c)
+  var constraints = {
+    video: {
+      facingMode: 'environment',
+      width:  { ideal: 1920 },
+      height: { ideal: 1920 },
+      focusMode: 'continuous'   // request continuous AF as default
+    }
+  };
+  navigator.mediaDevices.getUserMedia(constraints)
     .then(attachStream)
-    .catch(function(){
-      navigator.mediaDevices.getUserMedia({video:true})
+    .catch(function() {
+      /* Fallback: drop focusMode constraint (some browsers reject unknown keys) */
+      navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } })
         .then(attachStream)
-        .catch(function(e){ showToast('error','Camera Error','Cannot access camera: '+e.message); });
+        .catch(function() {
+          navigator.mediaDevices.getUserMedia({ video: true })
+            .then(attachStream)
+            .catch(function(err) {
+              showToast('error', 'Camera Error', 'Cannot access camera: ' + err.message);
+            });
+        });
     });
 }
 
 function attachStream(s) {
   stream = s;
-  var video = document.getElementById('videoFeed');
+  var video     = document.getElementById('videoFeed');
   video.srcObject = s;
+
+  /* Initialise ImageCapture for tap-to-focus (Chrome / Edge on Android) */
+  _imageCapture   = null;
+  _focusSupported = false;
+  try {
+    var videoTrack = s.getVideoTracks()[0];
+    if (videoTrack && typeof ImageCapture !== 'undefined') {
+      _imageCapture = new ImageCapture(videoTrack);
+      var caps = videoTrack.getCapabilities ? videoTrack.getCapabilities() : {};
+      _focusSupported = !!(caps.focusMode || caps.pointsOfInterest);
+      console.log('[Focus] ImageCapture ready. Tap-to-focus supported:', _focusSupported);
+    }
+  } catch (capErr) {
+    console.warn('[Focus] ImageCapture init failed (non-fatal):', capErr.message);
+  }
+
   var stage = document.getElementById('photoStage');
   stage.classList.add('active');
-  document.getElementById('stagePlaceholder').style.display='none';
+  document.getElementById('stagePlaceholder').style.display = 'none';
+
+  /* Update hint to show tap-to-focus is available */
+  var hintBar = document.getElementById('focusHintBar');
+  if (hintBar) {
+    hintBar.textContent = _focusSupported ? 'TAP TO FOCUS' : 'AUTO FOCUS';
+  }
+
   updateStepUI();
 }
 
 function stopCamera() {
-  if(stream){ stream.getTracks().forEach(function(t){t.stop();}); stream=null; }
+  if (_focusTimer) { clearTimeout(_focusTimer); _focusTimer = null; }
+  _hideFocusRing();
+  _imageCapture   = null;
+  _focusSupported = false;
+  if (stream) { stream.getTracks().forEach(function(t) { t.stop(); }); stream = null; }
+}
+
+/* ── CLICK-TO-FOCUS ─────────────────────────────────────────
+   Computes the click position as normalised (0–1) coordinates,
+   shows the focus ring, and requests point-of-interest focus
+   via ImageCapture API (supported on Chrome/Edge on Android).
+   Falls back gracefully on desktop — ring still shows, but
+   the camera stays on continuous AF.
+───────────────────────────────────────────────────────────── */
+function _selectFocusPoint(evt, stageEl) {
+  var rect = stageEl.getBoundingClientRect();
+
+  /* Position of click relative to the stage element */
+  var xPx = evt.clientX - rect.left;
+  var yPx = evt.clientY - rect.top;
+
+  /* Show focus ring at click position */
+  var ring = document.getElementById('focusRing');
+  if (ring) {
+    ring.style.left = xPx + 'px';
+    ring.style.top  = yPx + 'px';
+    ring.className  = 'focus-ring show';   // reset animation
+    void ring.offsetWidth;                 // reflow to replay animation
+
+    /* After 600 ms change to "locked" state */
+    if (_focusTimer) clearTimeout(_focusTimer);
+    _focusTimer = setTimeout(function() {
+      ring.classList.add('locked');
+    }, 600);
+  }
+
+  /* Normalised coordinates (0–1) for the ImageCapture API.
+     NOTE: the video preview is CSS-mirrored (scaleX(-1)), so we
+     must mirror the X coordinate before passing to the hardware. */
+  var normX = 1 - (xPx / rect.width);    // mirror X
+  var normY =      yPx / rect.height;
+
+  _applyFocus(normX, normY);
+}
+
+/* Attempt to apply focus at the given normalised point.
+   Silently swallows any error so the camera never breaks. */
+function _applyFocus(normX, normY) {
+  if (!_imageCapture || !_focusSupported) { return; }
+
+  try {
+    var videoTrack = stream && stream.getVideoTracks()[0];
+    if (!videoTrack) return;
+
+    videoTrack.applyConstraints({
+      advanced: [{
+        focusMode:        'manual',
+        pointsOfInterest: [{ x: normX, y: normY }]
+      }]
+    }).then(function() {
+      console.log('[Focus] Focus set at (' + normX.toFixed(2) + ', ' + normY.toFixed(2) + ')');
+      /* Restore continuous AF after 3 s so camera doesn't stay locked */
+      setTimeout(function() {
+        if (stream) {
+          var t = stream.getVideoTracks()[0];
+          if (t) {
+            t.applyConstraints({ advanced: [{ focusMode: 'continuous' }] })
+             .catch(function() {});
+          }
+        }
+      }, 3000);
+    }).catch(function(err) {
+      console.warn('[Focus] applyConstraints failed (device may not support POI):', err.message);
+    });
+  } catch (err) {
+    console.warn('[Focus] _applyFocus error (non-fatal):', err.message);
+  }
+}
+
+function _hideFocusRing() {
+  var ring = document.getElementById('focusRing');
+  if (ring) { ring.className = 'focus-ring'; }
 }
 
 /* ============================================================

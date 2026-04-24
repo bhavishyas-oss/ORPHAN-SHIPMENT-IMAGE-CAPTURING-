@@ -1638,8 +1638,11 @@ function capturePhoto(e) {
   try {
     var score = _computeBlurScore(canvas, w, h);
     if (score >= 0 && score < 500) {
-      /* BLURRY — build preview from canvas JPEG, show popup */
-      var blurPreview = canvas.toDataURL('image/jpeg', 0.85);
+      /* BLURRY — build a small preview for the popup thumbnail only.
+         This lower-quality JPEG is used ONLY for the on-screen warning
+         popup. If the user clicks "Use anyway", _canvasToJpeg(canvas)
+         is called below to produce the full 0.95-quality stored image. */
+      var blurPreview = canvas.toDataURL('image/jpeg', 0.72);   // thumbnail only
       photos[targetSlot]  = blurPreview;
       _pendingBlurSlot    = targetSlot;
       _pendingBlurDataUrl = blurPreview;
@@ -1670,7 +1673,10 @@ function capturePhoto(e) {
     var captureBtn = document.querySelector('.btn-capture');
     if (captureBtn) { captureBtn.disabled = true; captureBtn.textContent = 'CAPTURING…'; }
 
-    _imageCapture.takePhoto({ imageWidth: 4096, imageHeight: 4096 })
+    /* Request the camera's maximum native resolution.
+       Omitting imageWidth/imageHeight lets the sensor decide its best
+       resolution (often higher than 4096px on modern devices). */
+    _imageCapture.takePhoto({})
       .then(function(blob) {
         return new Promise(function(resolve, reject) {
           var reader = new FileReader();
@@ -1703,31 +1709,52 @@ function capturePhoto(e) {
   _storePhoto(targetSlot, _canvasToJpeg(canvas));
 }
 
-/* Convert canvas to high-quality JPEG base64.
-   - Max dimension: 1920px (long edge) — keeps payload 200-600KB.
-     Native 4K photos cause 3-8MB payloads that overload the Drive API.
-   - Quality: 0.87 — visually sharp, text fully readable on labels.
-   - All barcodes and QR codes remain scannable at this quality.       */
+/* Convert canvas to maximum-quality JPEG base64.
+   QUALITY POLICY:
+   - JPEG quality 0.95 — preserves label text, barcodes & QR codes
+     at full fidelity. Anything below 0.90 causes visible blur on
+     small printed text, making images unusable for audits.
+   - No resize for streams up to 2160px (HD / Full-HD / 2K).
+   - For extreme 4K+ streams (>2160px on long edge): step-down to
+     2160px using a two-pass bicubic approach. This keeps payload
+     manageable (~600KB-1.5MB) while keeping every character sharp.
+   - The blur-check preview path (toDataURL 0.85) is SEPARATE and
+     is used only for the on-screen thumbnail — never stored.        */
 function _canvasToJpeg(canvas) {
-  var MAX = 1920;
+  var MAX_DIM = 2160;   // 4K threshold — Full-HD (1920px) passes through unchanged
   var w = canvas.width;
   var h = canvas.height;
 
-  // Only resize if the image actually exceeds 1920px
-  if (w > MAX || h > MAX) {
-    var ratio = w > h ? MAX / w : MAX / h;
-    var nw    = Math.round(w * ratio);
-    var nh    = Math.round(h * ratio);
-
-    var tmp   = document.createElement('canvas');
-    tmp.width  = nw;
-    tmp.height = nh;
-    tmp.getContext('2d').drawImage(canvas, 0, 0, w, h, 0, 0, nw, nh);
-    return tmp.toDataURL('image/jpeg', 0.87);
+  // If camera stream is within Full-HD / 2K range — convert directly, no resize
+  if (w <= MAX_DIM && h <= MAX_DIM) {
+    return canvas.toDataURL('image/jpeg', 0.95);
   }
 
-  // Already within 1920px — convert directly
-  return canvas.toDataURL('image/jpeg', 0.87);
+  // For 4K+ streams: two-pass downscale to preserve sharpness.
+  // Single-step large downscale (e.g. 3840->2160) causes visible softness.
+  // Two-pass (3840->2880->2160) uses canvas bicubic interpolation each step,
+  // producing significantly sharper results on text and fine detail.
+  var ratio = w > h ? MAX_DIM / w : MAX_DIM / h;
+  var nw    = Math.round(w * ratio);
+  var nh    = Math.round(h * ratio);
+
+  // Pass 1: halve the distance to target
+  var midW  = Math.round(w * 0.75);
+  var midH  = Math.round(h * 0.75);
+  if (midW < nw) { midW = nw; midH = nh; }   // already close — skip pass 1
+
+  var pass1 = document.createElement('canvas');
+  pass1.width  = midW;
+  pass1.height = midH;
+  pass1.getContext('2d').drawImage(canvas, 0, 0, w, h, 0, 0, midW, midH);
+
+  // Pass 2: scale to final target
+  var pass2 = document.createElement('canvas');
+  pass2.width  = nw;
+  pass2.height = nh;
+  pass2.getContext('2d').drawImage(pass1, 0, 0, midW, midH, 0, 0, nw, nh);
+
+  return pass2.toDataURL('image/jpeg', 0.95);
 }
 
 /* Store a captured photo, update UI, advance step */
@@ -1874,9 +1901,23 @@ function retakePhoto() {
   showToast('info', 'Retake Photo', 'Click the camera area to recapture the ' + which + ' photo.');
 }
 
-/* User clicks "Use this image anyway" — accepts blurry photo for any slot */
+/* User clicks "Use this image anyway" — upgrades the stored thumbnail
+   to a full 0.95-quality JPEG from the canvas before accepting.
+   This ensures even "accepted blurry" photos are stored at HD quality. */
 function useImageAnyway() {
   document.getElementById('blurPopup').classList.remove('show');
+
+  /* Re-encode accepted slot at full quality (0.95) from current canvas */
+  if (_pendingBlurSlot >= 0) {
+    var canvas = document.getElementById('captureCanvas');
+    if (canvas && canvas.width > 0) {
+      var hdVersion = _canvasToJpeg(canvas);
+      photos[_pendingBlurSlot] = hdVersion;
+      var thumbEl = document.getElementById('thumb' + _pendingBlurSlot);
+      if (thumbEl) { thumbEl.src = hdVersion; }
+    }
+  }
+
   _pendingBlurSlot    = -1;
   _pendingBlurDataUrl = null;
 

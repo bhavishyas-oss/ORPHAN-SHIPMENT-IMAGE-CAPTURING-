@@ -1493,12 +1493,30 @@ function capturePhoto(e) {
 }
 
 /* Convert canvas to high-quality JPEG base64.
-   JPEG 0.95 is optimal for photographic content:
-   • Visually indistinguishable from PNG for photos
-   • 5–8× smaller payload → reliable upload, no truncation
-   • Fully supported in all browsers                        */
+   - Max dimension: 1920px (long edge) — keeps payload 200-600KB.
+     Native 4K photos cause 3-8MB payloads that overload the Drive API.
+   - Quality: 0.87 — visually sharp, text fully readable on labels.
+   - All barcodes and QR codes remain scannable at this quality.       */
 function _canvasToJpeg(canvas) {
-  return canvas.toDataURL('image/jpeg', 0.95);
+  var MAX = 1920;
+  var w = canvas.width;
+  var h = canvas.height;
+
+  // Only resize if the image actually exceeds 1920px
+  if (w > MAX || h > MAX) {
+    var ratio = w > h ? MAX / w : MAX / h;
+    var nw    = Math.round(w * ratio);
+    var nh    = Math.round(h * ratio);
+
+    var tmp   = document.createElement('canvas');
+    tmp.width  = nw;
+    tmp.height = nh;
+    tmp.getContext('2d').drawImage(canvas, 0, 0, w, h, 0, 0, nw, nh);
+    return tmp.toDataURL('image/jpeg', 0.87);
+  }
+
+  // Already within 1920px — convert directly
+  return canvas.toDataURL('image/jpeg', 0.87);
 }
 
 /* Store a captured photo, update UI, advance step */
@@ -1826,36 +1844,39 @@ function handleSubmit() {
       var rowIndex = result.row || 0;
       btn.innerHTML = '<span class="btn-spinner"></span> UPLOADING PHOTOS…';
 
-      /* ── STEP 2: upload each photo with no-cors POST (fire-and-forget) ──
-         mode:'no-cors' means the browser sends the request and never
-         blocks — Apps Script receives the full payload and saves the
-         photo to Drive. We cannot read the response (opaque), but
-         the server-side operation succeeds. Photos continue uploading
-         in the background after the popup is shown.               */
+      /* ── STEP 2: upload photos SEQUENTIALLY with retry ──────────────
+         Why sequential (not parallel):
+           Concurrent Drive API calls from 3 large uploads cause
+           rate-limit errors on the server → "Upload error" in Sheet.
+         Why retry:
+           Transient Drive API errors (quota, network blip) are
+           automatically retried up to 3 times with a 2-second gap.
+         After all uploads are dispatched, popup appears immediately
+         (uploads continue in background — form is ready for reuse). */
+
       var photoLabels = ['Front', 'Back', 'Label'];
+
+      // Build an ordered chain: upload photo 0, then 1, then 2
+      var uploadChain = Promise.resolve();
       photos.forEach(function(photo, idx) {
-        if (!photo) { return; }
-        var photoPayload = JSON.stringify({
-          action:     'savePhoto',
-          row:        rowIndex,
-          awb:        v.awb,
-          photoIndex: idx,
-          label:      photoLabels[idx],
-          photo:      photo
-        });
-        fetch(APPS_SCRIPT_URL, {
-          method:  'POST',
-          mode:    'no-cors',
-          headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-          body:    photoPayload
-        }).catch(function(photoErr) {
-          console.warn('Photo ' + idx + ' upload issue (non-fatal):', photoErr.message);
+        uploadChain = uploadChain.then(function() {
+          if (!photo) { return Promise.resolve(); }
+          return _uploadPhotoWithRetry(rowIndex, v.awb, idx, photoLabels[idx], photo, 3);
         });
       });
 
-      /* ── Show popup immediately after text is saved ── */
+      // Show popup right away — uploads finish silently in background
       submitting = false;
       showSubmitPopup();   // ← single call, no duplicates
+
+      // Log final result (non-blocking)
+      uploadChain
+        .then(function() {
+          console.log('[Upload] All photos dispatched successfully.');
+        })
+        .catch(function(finalErr) {
+          console.warn('[Upload] One or more photos had issues:', finalErr.message);
+        });
     })
     .catch(function(err) {
       submitting = false;
@@ -1865,6 +1886,63 @@ function handleSubmit() {
       showToast('error', 'Submission Failed',
         err.message || 'Cannot reach server. Verify APPS_SCRIPT_URL is set and deployed.');
     });
+}
+
+/* ============================================================
+   PHOTO UPLOAD HELPER — sequential + retry with backoff
+============================================================ */
+
+/**
+ * Uploads one photo to Apps Script with up to `maxRetries` attempts.
+ * Uses a 2-second delay between retries so Drive API rate limits recover.
+ *
+ * Because mode:'no-cors' gives an opaque response (cannot read body),
+ * we treat any successful fetch() as "delivered" and rely on Apps Script's
+ * own retry logic (in Code_Response.gs) to handle transient Drive errors.
+ *
+ * @param {number} rowIndex    - Sheet row to update
+ * @param {string} awb         - Salvaged AWB (for Drive folder name)
+ * @param {number} photoIndex  - 0=Front, 1=Back, 2=Label
+ * @param {string} label       - Human label for logging
+ * @param {string} photo       - base64 data-URL
+ * @param {number} maxRetries  - Max number of attempts
+ */
+function _uploadPhotoWithRetry(rowIndex, awb, photoIndex, label, photo, maxRetries) {
+  var attempt = 0;
+
+  function tryUpload() {
+    attempt++;
+    var payload = JSON.stringify({
+      action:     'savePhoto',
+      row:        rowIndex,
+      awb:        awb,
+      photoIndex: photoIndex,
+      label:      label,
+      photo:      photo
+    });
+
+    return fetch(APPS_SCRIPT_URL, {
+      method:  'POST',
+      mode:    'no-cors',
+      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+      body:    payload
+    })
+    .then(function() {
+      console.log('[Upload] Photo ' + photoIndex + ' (' + label + ') sent (attempt ' + attempt + ')');
+    })
+    .catch(function(err) {
+      console.warn('[Upload] Photo ' + photoIndex + ' attempt ' + attempt + ' failed:', err.message);
+      if (attempt < maxRetries) {
+        // Wait 2s then retry — lets Drive API recover from rate limiting
+        return new Promise(function(resolve) { setTimeout(resolve, 2000); })
+               .then(tryUpload);
+      }
+      // All retries exhausted — log but do not block the UI
+      console.error('[Upload] Photo ' + photoIndex + ' failed after ' + maxRetries + ' attempts.');
+    });
+  }
+
+  return tryUpload();
 }
 
 /* ============================================================

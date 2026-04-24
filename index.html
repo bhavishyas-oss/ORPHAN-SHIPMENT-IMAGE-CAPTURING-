@@ -614,6 +614,65 @@ body{
 .canvas-hidden{display:none;}
 .divider{height:1px;background:var(--border);margin:14px 0;}
 
+/* ── AUTO-FOCUS QUALITY BAR ─────────────────────────────────
+   Shown inside the camera preview while live.
+   Fills left-to-right: Red → Yellow → Green as focus improves.
+   Sits above the Capture button, below the video feed.      */
+.af-bar-wrap{
+  position:absolute;
+  bottom:52px;left:10px;right:10px;
+  height:26px;
+  background:rgba(0,0,0,.55);
+  border-radius:4px;
+  border:1px solid rgba(255,255,255,.15);
+  overflow:hidden;
+  display:none;                    /* hidden until camera is active */
+  z-index:12;
+  pointer-events:none;
+}
+.photo-stage.active .af-bar-wrap{ display:block; }
+
+.af-bar-fill{
+  position:absolute;
+  top:0;left:0;bottom:0;
+  width:0%;
+  border-radius:4px;
+  transition:width .22s ease, background .35s ease;
+  background:#e74c3c;             /* red = blurry */
+}
+
+/* colour states driven by JS class on .af-bar-fill */
+.af-bar-fill.af-poor    { background:#e74c3c; }     /* red    < 150  */
+.af-bar-fill.af-fair    { background:#e67e22; }     /* orange 150-350 */
+.af-bar-fill.af-good    { background:#f1c40f; }     /* yellow 350-600 */
+.af-bar-fill.af-sharp   { background:#2ecc71; }     /* green  > 600   */
+
+.af-bar-label{
+  position:absolute;
+  inset:0;
+  display:flex;align-items:center;justify-content:center;
+  font-family:'JetBrains Mono',monospace;
+  font-size:.6rem;
+  font-weight:700;
+  letter-spacing:2px;
+  color:rgba(255,255,255,.9);
+  text-shadow:0 1px 3px rgba(0,0,0,.8);
+  pointer-events:none;
+  user-select:none;
+}
+
+/* Capture button dim when focus is poor */
+.btn-capture.af-waiting{
+  background:rgba(233,223,67,.45);
+  color:rgba(26,26,0,.6);
+  cursor:default;
+}
+.btn-capture.af-locked{
+  background:var(--accent);
+  box-shadow:0 0 14px rgba(46,204,113,.55);
+  color:#1a1a00;
+}
+
 /* ── SESSION POC BADGE ── */
 .session-badge{
   display:none;
@@ -868,6 +927,11 @@ body{
           <div class="focus-ring" id="focusRing"></div>
           <!-- Focus mode hint -->
           <div class="focus-hint-bar" id="focusHintBar">TAP TO FOCUS</div>
+          <!-- Auto-focus quality monitor bar (visible while camera is live) -->
+          <div class="af-bar-wrap" id="afBarWrap">
+            <div class="af-bar-fill af-poor" id="afBarFill"></div>
+            <div class="af-bar-label" id="afBarLabel">AUTO FOCUS</div>
+          </div>
           <video id="videoFeed" autoplay playsinline></video>
           <div class="capture-overlay">
             <button class="btn-capture" onclick="capturePhoto(event)">&#9679; CAPTURE</button>
@@ -1260,10 +1324,10 @@ function startCamera() {
 
 function attachStream(s) {
   stream = s;
-  var video     = document.getElementById('videoFeed');
+  var video = document.getElementById('videoFeed');
   video.srcObject = s;
 
-  /* Initialise ImageCapture for tap-to-focus (Chrome / Edge on Android) */
+  /* Initialise ImageCapture for tap-to-focus */
   _imageCapture   = null;
   _focusSupported = false;
   try {
@@ -1272,28 +1336,42 @@ function attachStream(s) {
       _imageCapture = new ImageCapture(videoTrack);
       var caps = videoTrack.getCapabilities ? videoTrack.getCapabilities() : {};
       _focusSupported = !!(caps.focusMode || caps.pointsOfInterest);
-      console.log('[Focus] ImageCapture ready. Tap-to-focus supported:', _focusSupported);
+      console.log('[AF] ImageCapture ready. Hardware AF supported:', _focusSupported);
+
+      /* Request continuous AF immediately when hardware supports it */
+      if (_focusSupported) {
+        videoTrack.applyConstraints({ advanced: [{ focusMode: 'continuous' }] })
+          .then(function() { console.log('[AF] Continuous AF engaged.'); })
+          .catch(function(err) { console.warn('[AF] Continuous AF not available:', err.message); });
+      }
     }
   } catch (capErr) {
-    console.warn('[Focus] ImageCapture init failed (non-fatal):', capErr.message);
+    console.warn('[AF] ImageCapture init (non-fatal):', capErr.message);
   }
 
   var stage = document.getElementById('photoStage');
   stage.classList.add('active');
   document.getElementById('stagePlaceholder').style.display = 'none';
 
-  /* Update hint to show tap-to-focus is available */
   var hintBar = document.getElementById('focusHintBar');
   if (hintBar) {
     hintBar.textContent = _focusSupported ? 'TAP TO FOCUS' : 'AUTO FOCUS';
   }
+
+  /* Start the live AF quality monitor once video is playing */
+  video.oncanplay = function() {
+    video.oncanplay = null;   // run once
+    _startFocusMonitor();
+  };
 
   updateStepUI();
 }
 
 function stopCamera() {
   if (_focusTimer) { clearTimeout(_focusTimer); _focusTimer = null; }
+  _stopFocusMonitor();
   _hideFocusRing();
+  _resetAfBar();
   _imageCapture   = null;
   _focusSupported = false;
   if (stream) { stream.getTracks().forEach(function(t) { t.stop(); }); stream = null; }
@@ -1374,6 +1452,139 @@ function _applyFocus(normX, normY) {
 function _hideFocusRing() {
   var ring = document.getElementById('focusRing');
   if (ring) { ring.className = 'focus-ring'; }
+}
+
+/* ============================================================
+   AUTO-FOCUS QUALITY MONITOR
+   Runs on requestAnimationFrame while the camera is live.
+   Every AF_INTERVAL ms it:
+     1. Draws a small sample frame from the live video
+     2. Computes a Laplacian variance blur score
+     3. Updates the AF bar colour and label
+     4. Dims / brightens the Capture button accordingly
+     5. If hardware AF is supported, nudges continuous-AF mode
+
+   Score thresholds (same scale as _computeBlurScore):
+     < 150   RED    "FOCUSING..."      - image too blurry
+     150-350 ORANGE "ADJUSTING..."     - marginal, keep still
+     350-600 YELLOW "HOLD STEADY"      - almost sharp
+     > 600   GREEN  "FOCUS LOCKED"     - sharp, ready to capture
+============================================================ */
+var _afRafId     = null;   // requestAnimationFrame handle
+var _afLastMs    = 0;      // timestamp of last analysis
+var _afScore     = -1;     // most recent focus score (-1 = unknown)
+var AF_INTERVAL  = 180;    // ms between analyses (~5-6 fps)
+var AF_SHARP     = 600;    // score >= this = FOCUS LOCKED
+var AF_GOOD      = 350;    // score >= this = HOLD STEADY
+var AF_FAIR      = 150;    // score >= this = ADJUSTING
+
+function _startFocusMonitor() {
+  _afScore  = -1;
+  _afLastMs = 0;
+
+  function _afLoop(timestamp) {
+    if (timestamp - _afLastMs >= AF_INTERVAL) {
+      _afLastMs = timestamp;
+      _afCheckFrame();
+    }
+    _afRafId = requestAnimationFrame(_afLoop);
+  }
+
+  _afRafId = requestAnimationFrame(_afLoop);
+  console.log('[AF] Monitor started.');
+}
+
+function _stopFocusMonitor() {
+  if (_afRafId) {
+    cancelAnimationFrame(_afRafId);
+    _afRafId = null;
+  }
+  _afScore = -1;
+  console.log('[AF] Monitor stopped.');
+}
+
+/* Sample a 200x150 frame from the live video and score it */
+function _afCheckFrame() {
+  var video = document.getElementById('videoFeed');
+  if (!video || video.readyState < 2 || !video.videoWidth || !video.videoHeight) return;
+  if (!stream) return;   // camera was stopped
+
+  try {
+    /* Draw analysis frame — small size for speed, not stored anywhere */
+    var aw = 200, ah = 150;
+    var tmp = document.createElement('canvas');
+    tmp.width  = aw;
+    tmp.height = ah;
+    tmp.getContext('2d').drawImage(
+      video, 0, 0, video.videoWidth, video.videoHeight, 0, 0, aw, ah
+    );
+
+    /* Reuse the existing Laplacian blur scorer */
+    var score = _computeBlurScore(tmp, aw, ah);
+    if (score < 0) return;   // analysis unavailable (canvas taint)
+
+    _afScore = score;
+    _updateAfBar(score);
+
+  } catch (err) {
+    /* Non-fatal — log once then silence */
+    console.warn('[AF] Frame analysis error (non-fatal):', err.message);
+  }
+}
+
+/* Update the AF bar fill, colour class, and label text */
+function _updateAfBar(score) {
+  var fill  = document.getElementById('afBarFill');
+  var label = document.getElementById('afBarLabel');
+  var btn   = document.querySelector('.btn-capture');
+  if (!fill || !label) return;
+
+  var pct, cls, text;
+
+  if (score >= AF_SHARP) {
+    pct  = 100;
+    cls  = 'af-sharp';
+    text = 'FOCUS LOCKED';
+  } else if (score >= AF_GOOD) {
+    pct  = Math.round(50 + ((score - AF_GOOD) / (AF_SHARP - AF_GOOD)) * 50);
+    cls  = 'af-good';
+    text = 'HOLD STEADY';
+  } else if (score >= AF_FAIR) {
+    pct  = Math.round(15 + ((score - AF_FAIR) / (AF_GOOD  - AF_FAIR)) * 35);
+    cls  = 'af-fair';
+    text = 'ADJUSTING...';
+  } else {
+    pct  = Math.max(3, Math.round((score / AF_FAIR) * 15));
+    cls  = 'af-poor';
+    text = 'FOCUSING...';
+  }
+
+  fill.style.width = pct + '%';
+  fill.className   = 'af-bar-fill ' + cls;
+  label.textContent = text + '  [' + Math.round(score) + ']';
+
+  /* Dim capture button while focusing, highlight when sharp */
+  if (btn) {
+    if (score >= AF_SHARP) {
+      btn.classList.remove('af-waiting');
+      btn.classList.add('af-locked');
+    } else if (score >= AF_FAIR) {
+      btn.classList.remove('af-locked', 'af-waiting');
+    } else {
+      btn.classList.remove('af-locked');
+      btn.classList.add('af-waiting');
+    }
+  }
+}
+
+/* Reset AF bar to neutral state (called when camera stops) */
+function _resetAfBar() {
+  var fill  = document.getElementById('afBarFill');
+  var label = document.getElementById('afBarLabel');
+  var btn   = document.querySelector('.btn-capture');
+  if (fill)  { fill.style.width = '0%'; fill.className = 'af-bar-fill af-poor'; }
+  if (label) { label.textContent = 'AUTO FOCUS'; }
+  if (btn)   { btn.classList.remove('af-waiting', 'af-locked'); }
 }
 
 /* ============================================================

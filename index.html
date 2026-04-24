@@ -978,7 +978,7 @@ body{
    The credentials sheet must be shared as
    "Anyone with the link → Viewer" for direct read to work.
 ============================================================ */
-var APPS_SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbx4kmwClQmqP-X10vSScBZdqk1yzUwO1QQvGUuDjMRyRiGugJs37_ahBIWVSDrVdyRS/exec';
+var APPS_SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbwG46ywMicp68xefUmfm1VI3wM4tR63L7V5tN18lUS3BK-wo6ZC3OMjYv95VSJN8TTv/exec';
 var CREDS_SHEET_ID  = '1139mNsQJRa2QFAJvgY2MMVm9QbozDjYI93tO8gPpyNc';
 
 /* ── Auth state ── */
@@ -1221,25 +1221,38 @@ function stageClicked(evt) {
 }
 
 function startCamera() {
-  var constraints = {
+  // Level-1: request max resolution + continuous AF
+  // min:1280 forces the browser to use HD — without min, many browsers silently
+  // serve 640×480 even when ideal:4096 is set.
+  var c1 = {
     video: {
       facingMode: 'environment',
-      width:  { ideal: 1920 },
-      height: { ideal: 1920 },
-      focusMode: 'continuous'   // request continuous AF as default
+      width:  { min: 1280, ideal: 4096 },
+      height: { min: 720,  ideal: 4096 },
+      frameRate: { ideal: 30 }
     }
   };
-  navigator.mediaDevices.getUserMedia(constraints)
+  // Level-2: HD without framerate constraint
+  var c2 = { video: { facingMode: 'environment', width: { min: 1280 }, height: { min: 720 } } };
+  // Level-3: any rear camera
+  var c3 = { video: { facingMode: 'environment' } };
+  // Level-4: any camera
+  var c4 = { video: true };
+
+  navigator.mediaDevices.getUserMedia(c1)
     .then(attachStream)
     .catch(function() {
-      /* Fallback: drop focusMode constraint (some browsers reject unknown keys) */
-      navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } })
+      navigator.mediaDevices.getUserMedia(c2)
         .then(attachStream)
         .catch(function() {
-          navigator.mediaDevices.getUserMedia({ video: true })
+          navigator.mediaDevices.getUserMedia(c3)
             .then(attachStream)
-            .catch(function(err) {
-              showToast('error', 'Camera Error', 'Cannot access camera: ' + err.message);
+            .catch(function() {
+              navigator.mediaDevices.getUserMedia(c4)
+                .then(attachStream)
+                .catch(function(err) {
+                  showToast('error', 'Camera Error', 'Cannot access camera: ' + err.message);
+                });
             });
         });
     });
@@ -1364,12 +1377,26 @@ function _hideFocusRing() {
 }
 
 /* ============================================================
-   CAPTURE
-   ── Mirroring: the live video preview is CSS-mirrored
-      (transform:scaleX(-1)). We draw the video frame DIRECTLY
-      (no canvas flip) so the saved PNG matches exactly what the
-      user sees on screen — a horizontally mirrored image.
-   ── Blur check runs on EVERY slot (Front, Back, Label).
+   CAPTURE — HIGH QUALITY, TWO-PATH
+
+   PATH A (primary, async): ImageCapture.takePhoto()
+     ► Captures at the camera SENSOR's native resolution
+       (e.g. 12 MP on modern phones — far higher than stream preview)
+     ► Returns a Blob → converted to JPEG 0.95 base64
+     ► Triggered only when ImageCapture API is available
+
+   PATH B (fallback, sync): Canvas drawImage → JPEG 0.95
+     ► Captures at the video stream resolution (1280–4096px)
+     ► JPEG 0.95 for photos: visually identical to PNG,
+       5-8× smaller payload → reliable upload, no truncation
+
+   BLUR CHECK:
+     Always uses the canvas frame (stream resolution) for speed.
+     The stored image uses the high-quality path above.
+
+   MIRRORING:
+     The CSS preview is scaleX(-1). Drawing directly (no canvas flip)
+     saves the mirrored image — matching what the user sees.
 ============================================================ */
 function capturePhoto(e) {
   e.stopPropagation();
@@ -1383,42 +1410,35 @@ function capturePhoto(e) {
   var canvas = document.getElementById('captureCanvas');
   var ctx    = canvas.getContext('2d');
 
-  // Full original camera resolution — no downscaling, no compression
-  var w = video.videoWidth  || 1280;
-  var h = video.videoHeight || 720;
+  /* Wait for video to have actual resolution data */
+  var w = (video.videoWidth  && video.videoWidth  > 0) ? video.videoWidth  : 1280;
+  var h = (video.videoHeight && video.videoHeight > 0) ? video.videoHeight : 720;
+
+  /* Draw current frame to canvas at full stream resolution */
   canvas.width  = w;
   canvas.height = h;
-
-  // Draw video frame directly — this saves the MIRRORED image,
-  // matching exactly what the user sees in the live preview.
-  // (The CSS transform:scaleX(-1) on #videoFeed mirrors the preview;
-  //  drawing without a canvas flip preserves that mirror in the saved file.)
   ctx.drawImage(video, 0, 0, w, h);
 
-  // PNG = lossless full original quality — no quality param
-  var dataUrl = canvas.toDataURL('image/png');
+  /* Trigger camera flash immediately (visual feedback) */
+  var flashEl = document.getElementById('flashOverlay');
+  flashEl.classList.remove('go'); void flashEl.offsetWidth; flashEl.classList.add('go');
 
-  // ── Blur check on ALL slots (Front=0, Back=1, Label=2) ──
-  // Wrapped in try/catch so no error can ever prevent capture from completing.
+  /* ── BLUR CHECK (uses canvas frame — fast sync operation) ── */
   try {
     var score = _computeBlurScore(canvas, w, h);
-    // score = -1 → analysis unavailable (canvas taint) → skip check
     if (score >= 0 && score < 500) {
-      // BLURRY — store tentatively, show popup, block submit
-      photos[targetSlot]  = dataUrl;
+      /* BLURRY — build preview from canvas JPEG, show popup */
+      var blurPreview = canvas.toDataURL('image/jpeg', 0.85);
+      photos[targetSlot]  = blurPreview;
       _pendingBlurSlot    = targetSlot;
-      _pendingBlurDataUrl = dataUrl;
+      _pendingBlurDataUrl = blurPreview;
 
       var slotEl  = document.getElementById('slot'+targetSlot);
       var thumbEl = document.getElementById('thumb'+targetSlot);
-      thumbEl.src = dataUrl;
+      thumbEl.src = blurPreview;
       slotEl.classList.remove('pending','active-slot');
       slotEl.classList.add('done');
 
-      var flashEl = document.getElementById('flashOverlay');
-      flashEl.classList.remove('go'); void flashEl.offsetWidth; flashEl.classList.add('go');
-
-      // Update popup content for the specific slot
       var slotNames = ['FRONT PHOTO','BACK PHOTO','LABEL PHOTO'];
       document.getElementById('blurPopupTitle').textContent =
         slotNames[targetSlot] + ' IS TOO BLURRY';
@@ -1427,15 +1447,62 @@ function capturePhoto(e) {
 
       document.getElementById('blurPopup').classList.add('show');
       onFieldChange();
-      return;  // halt — user must retake or accept
+      return;  /* halt — user must retake or accept */
     }
-    // score >= 500  → sharp, fall through to normal acceptance below
   } catch (blurErr) {
-    // Safety net — log and continue so capture never silently fails
     console.error('[BlurCheck] error in capturePhoto:', blurErr);
   }
 
-  // ── Normal acceptance (sharp image or check unavailable) ──
+  /* ── PATH A: ImageCapture.takePhoto() — native sensor resolution ── */
+  if (_imageCapture && typeof _imageCapture.takePhoto === 'function') {
+    /* Disable button to prevent double-capture during async op */
+    var captureBtn = document.querySelector('.btn-capture');
+    if (captureBtn) { captureBtn.disabled = true; captureBtn.textContent = 'CAPTURING…'; }
+
+    _imageCapture.takePhoto({ imageWidth: 4096, imageHeight: 4096 })
+      .then(function(blob) {
+        return new Promise(function(resolve, reject) {
+          var reader = new FileReader();
+          reader.onloadend = function() {
+            /* FileReader gives data:image/jpeg;base64,... */
+            resolve(reader.result);
+          };
+          reader.onerror = function() { reject(new Error('FileReader failed')); };
+          reader.readAsDataURL(blob);
+        });
+      })
+      .then(function(dataUrl) {
+        /* Re-enable button */
+        if (captureBtn) { captureBtn.disabled = false; captureBtn.textContent = '● CAPTURE'; }
+        console.log('[Capture] takePhoto() success — size: ' +
+                    Math.round(dataUrl.length / 1024) + ' KB base64');
+        _storePhoto(targetSlot, dataUrl);
+      })
+      .catch(function(takeErr) {
+        /* takePhoto() failed — fall through to canvas path */
+        console.warn('[Capture] takePhoto() failed, using canvas fallback:', takeErr.message);
+        if (captureBtn) { captureBtn.disabled = false; captureBtn.textContent = '● CAPTURE'; }
+        _storePhoto(targetSlot, _canvasToJpeg(canvas));
+      });
+
+    return;  /* async path — _storePhoto called in .then() */
+  }
+
+  /* ── PATH B: canvas fallback — JPEG 0.95 ── */
+  _storePhoto(targetSlot, _canvasToJpeg(canvas));
+}
+
+/* Convert canvas to high-quality JPEG base64.
+   JPEG 0.95 is optimal for photographic content:
+   • Visually indistinguishable from PNG for photos
+   • 5–8× smaller payload → reliable upload, no truncation
+   • Fully supported in all browsers                        */
+function _canvasToJpeg(canvas) {
+  return canvas.toDataURL('image/jpeg', 0.95);
+}
+
+/* Store a captured photo, update UI, advance step */
+function _storePhoto(targetSlot, dataUrl) {
   photos[targetSlot] = dataUrl;
 
   var slot  = document.getElementById('slot'+targetSlot);
@@ -1443,9 +1510,6 @@ function capturePhoto(e) {
   thumb.src = dataUrl;
   slot.classList.remove('pending','active-slot');
   slot.classList.add('done');
-
-  var flash = document.getElementById('flashOverlay');
-  flash.classList.remove('go'); void flash.offsetWidth; flash.classList.add('go');
 
   /* Advance currentStep to next null slot */
   currentStep = 0;
@@ -1468,7 +1532,8 @@ function capturePhoto(e) {
       }
     }
     updateStepUI();
-    showToast('info','Photo Captured',STEP_LABELS[targetSlot]+' saved. Capture next: '+STEP_DISPLAY[currentStep]);
+    showToast('info','Photo Captured',
+      STEP_LABELS[targetSlot]+' saved. Capture next: '+STEP_DISPLAY[currentStep]);
   }
 }
 

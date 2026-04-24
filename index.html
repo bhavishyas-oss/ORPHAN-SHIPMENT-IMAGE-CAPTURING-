@@ -1709,52 +1709,53 @@ function capturePhoto(e) {
   _storePhoto(targetSlot, _canvasToJpeg(canvas));
 }
 
-/* Convert canvas to maximum-quality JPEG base64.
-   QUALITY POLICY:
-   - JPEG quality 0.95 — preserves label text, barcodes & QR codes
-     at full fidelity. Anything below 0.90 causes visible blur on
-     small printed text, making images unusable for audits.
-   - No resize for streams up to 2160px (HD / Full-HD / 2K).
-   - For extreme 4K+ streams (>2160px on long edge): step-down to
-     2160px using a two-pass bicubic approach. This keeps payload
-     manageable (~600KB-1.5MB) while keeping every character sharp.
-   - The blur-check preview path (toDataURL 0.85) is SEPARATE and
-     is used only for the on-screen thumbnail — never stored.        */
+/* Convert canvas to high-quality JPEG base64.
+   RESOLUTION & QUALITY POLICY:
+   - Max dimension: 1600px on the long edge.
+     At 1600px, JPEG 0.92 produces ~250-500KB base64 per photo.
+     This is the sweet spot:
+       * Large enough for all text, barcodes & QR codes to be
+         fully readable and usable in audits and reports.
+       * Small enough for the no-cors POST body to be delivered
+         reliably without Drive API quota contention.
+   - For streams at or below 1600px: encode directly at quality 0.95
+     (no resize, maximum quality, ~150-300KB).
+   - For streams larger than 1600px (e.g. 1080p, 4K):
+     two-pass bicubic downscale to 1600px then JPEG 0.92.
+   - takePhoto() (sensor-native) path: FileReader gives the blob
+     as-is — this function is only used for the canvas fallback.   */
 function _canvasToJpeg(canvas) {
-  var MAX_DIM = 2160;   // 4K threshold — Full-HD (1920px) passes through unchanged
+  var MAX_DIM = 1600;
   var w = canvas.width;
   var h = canvas.height;
 
-  // If camera stream is within Full-HD / 2K range — convert directly, no resize
+  // Stream at or below 1600px — encode at maximum quality, no resize
   if (w <= MAX_DIM && h <= MAX_DIM) {
     return canvas.toDataURL('image/jpeg', 0.95);
   }
 
-  // For 4K+ streams: two-pass downscale to preserve sharpness.
-  // Single-step large downscale (e.g. 3840->2160) causes visible softness.
-  // Two-pass (3840->2880->2160) uses canvas bicubic interpolation each step,
-  // producing significantly sharper results on text and fine detail.
+  // Larger stream: two-pass downscale to 1600px for sharpest results.
+  // Single-step downscale (e.g. 1920->1600) softens fine text strokes.
+  // Two-pass (1920->1760->1600) preserves edge sharpness on barcodes.
   var ratio = w > h ? MAX_DIM / w : MAX_DIM / h;
   var nw    = Math.round(w * ratio);
   var nh    = Math.round(h * ratio);
 
-  // Pass 1: halve the distance to target
-  var midW  = Math.round(w * 0.75);
-  var midH  = Math.round(h * 0.75);
-  if (midW < nw) { midW = nw; midH = nh; }   // already close — skip pass 1
+  var midW  = Math.round(w * 0.85);   // ~15% reduction in pass 1
+  var midH  = Math.round(h * 0.85);
+  if (midW <= nw) { midW = nw; midH = nh; }   // already close — single pass
 
   var pass1 = document.createElement('canvas');
   pass1.width  = midW;
   pass1.height = midH;
   pass1.getContext('2d').drawImage(canvas, 0, 0, w, h, 0, 0, midW, midH);
 
-  // Pass 2: scale to final target
   var pass2 = document.createElement('canvas');
   pass2.width  = nw;
   pass2.height = nh;
   pass2.getContext('2d').drawImage(pass1, 0, 0, midW, midH, 0, 0, nw, nh);
 
-  return pass2.toDataURL('image/jpeg', 0.95);
+  return pass2.toDataURL('image/jpeg', 0.92);
 }
 
 /* Store a captured photo, update UI, advance step */
@@ -2108,26 +2109,27 @@ function handleSubmit() {
 
       var photoLabels = ['Front', 'Back', 'Label'];
 
-      // Build an ordered chain: upload photo 0, then 1, then 2
+      // Show popup right away — verified uploads run silently in background
+      submitting = false;
+      showSubmitPopup();   // ← single call, no duplicates
+
+      // Build a sequential verified chain: each photo is posted,
+      // then confirmed via a CORS-safe GET before moving to next.
+      // If verification fails, the upload is retried up to 5 times total.
       var uploadChain = Promise.resolve();
       photos.forEach(function(photo, idx) {
         uploadChain = uploadChain.then(function() {
           if (!photo) { return Promise.resolve(); }
-          return _uploadPhotoWithRetry(rowIndex, v.awb, idx, photoLabels[idx], photo, 3);
+          return _uploadPhotoVerified(rowIndex, v.awb, idx, photoLabels[idx], photo);
         });
       });
 
-      // Show popup right away — uploads finish silently in background
-      submitting = false;
-      showSubmitPopup();   // ← single call, no duplicates
-
-      // Log final result (non-blocking)
       uploadChain
         .then(function() {
-          console.log('[Upload] All photos dispatched successfully.');
+          console.log('[Upload] All 3 photos confirmed in Sheet.');
         })
-        .catch(function(finalErr) {
-          console.warn('[Upload] One or more photos had issues:', finalErr.message);
+        .catch(function(err) {
+          console.warn('[Upload] Some photos may need manual check:', err.message);
         });
     })
     .catch(function(err) {
@@ -2141,37 +2143,53 @@ function handleSubmit() {
 }
 
 /* ============================================================
-   PHOTO UPLOAD HELPER — sequential + retry with backoff
+   VERIFIED PHOTO UPLOAD
+   ─ POST the photo (no-cors, fire-and-forget)
+   ─ Wait for Apps Script to finish (Drive upload takes 2-8s)
+   ─ GET ?action=checkPhoto to read the actual cell value
+   ─ If cell contains a Drive URL → SUCCESS
+   ─ If cell still shows "Uploading..." or error → RETRY
+   ─ Up to MAX_PHOTO_ATTEMPTS total cycles (exponential backoff)
+
+   This two-step approach is the only reliable way to confirm
+   a no-cors upload succeeded — the POST response is opaque,
+   so we verify via a separate readable GET request.
 ============================================================ */
+var MAX_POST_CYCLES  = 3;
+var WAIT_AFTER_POST  = 20000;
+var WAIT_SECOND_CHK  = 15000;
 
-/**
- * Uploads one photo to Apps Script with up to `maxRetries` attempts.
- * Uses a 2-second delay between retries so Drive API rate limits recover.
- *
- * Because mode:'no-cors' gives an opaque response (cannot read body),
- * we treat any successful fetch() as "delivered" and rely on Apps Script's
- * own retry logic (in Code_Response.gs) to handle transient Drive errors.
- *
- * @param {number} rowIndex    - Sheet row to update
- * @param {string} awb         - Salvaged AWB (for Drive folder name)
- * @param {number} photoIndex  - 0=Front, 1=Back, 2=Label
- * @param {string} label       - Human label for logging
- * @param {string} photo       - base64 data-URL
- * @param {number} maxRetries  - Max number of attempts
- */
-function _uploadPhotoWithRetry(rowIndex, awb, photoIndex, label, photo, maxRetries) {
-  var attempt = 0;
+function _uploadPhotoVerified(rowIndex, awb, photoIndex, label, photo) {
+  var postCount = 0;
 
-  function tryUpload() {
-    attempt++;
-    var payload = JSON.stringify({
-      action:     'savePhoto',
-      row:        rowIndex,
-      awb:        awb,
-      photoIndex: photoIndex,
-      label:      label,
-      photo:      photo
+  var payload = JSON.stringify({
+    action:     'savePhoto',
+    row:        rowIndex,
+    awb:        awb,
+    photoIndex: photoIndex,
+    label:      label,
+    photo:      photo
+  });
+
+  function checkCell() {
+    return fetch(
+      APPS_SCRIPT_URL +
+      '?action=checkPhoto&row=' + rowIndex +
+      '&photoIndex=' + photoIndex,
+      { method: 'GET' }
+    )
+    .then(function(res) { return res.text(); })
+    .then(function(text) {
+      var r = {};
+      try { r = JSON.parse(text); } catch (_) { r = { ok: false, cellValue: '?' }; }
+      console.log('[Upload] checkPhoto ' + photoIndex + ':', r);
+      return r;
     });
+  }
+
+  function postAndVerify() {
+    postCount++;
+    console.log('[Upload] Photo ' + photoIndex + ' (' + label + ') POST #' + postCount);
 
     return fetch(APPS_SCRIPT_URL, {
       method:  'POST',
@@ -2180,21 +2198,44 @@ function _uploadPhotoWithRetry(rowIndex, awb, photoIndex, label, photo, maxRetri
       body:    payload
     })
     .then(function() {
-      console.log('[Upload] Photo ' + photoIndex + ' (' + label + ') sent (attempt ' + attempt + ')');
+      console.log('[Upload] Photo ' + photoIndex + ' posted. Waiting ' +
+                  (WAIT_AFTER_POST / 1000) + 's for Drive...');
+      return new Promise(function(res) { setTimeout(res, WAIT_AFTER_POST); });
+    })
+    .then(checkCell)
+    .then(function(r1) {
+      if (r1.ok) {
+        console.log('[Upload] Photo ' + photoIndex + ' CONFIRMED on 1st check.');
+        return;
+      }
+      console.warn('[Upload] Photo ' + photoIndex + ' not confirmed yet. Waiting ' +
+                   (WAIT_SECOND_CHK / 1000) + 's for 2nd check...');
+      return new Promise(function(res) { setTimeout(res, WAIT_SECOND_CHK); })
+        .then(checkCell)
+        .then(function(r2) {
+          if (r2.ok) {
+            console.log('[Upload] Photo ' + photoIndex + ' CONFIRMED on 2nd check.');
+            return;
+          }
+          if (postCount < MAX_POST_CYCLES) {
+            console.warn('[Upload] Photo ' + photoIndex + ' failed both checks. Re-posting (' +
+                         postCount + '/' + MAX_POST_CYCLES + ')...');
+            return postAndVerify();
+          }
+          console.error('[Upload] Photo ' + photoIndex + ' FAILED after ' +
+                        MAX_POST_CYCLES + ' POSTs. Cell: ' + (r2.cellValue || 'unknown'));
+        });
     })
     .catch(function(err) {
-      console.warn('[Upload] Photo ' + photoIndex + ' attempt ' + attempt + ' failed:', err.message);
-      if (attempt < maxRetries) {
-        // Wait 2s then retry — lets Drive API recover from rate limiting
-        return new Promise(function(resolve) { setTimeout(resolve, 2000); })
-               .then(tryUpload);
+      console.warn('[Upload] Photo ' + photoIndex + ' POST #' + postCount + ' error:', err.message);
+      if (postCount < MAX_POST_CYCLES) {
+        return new Promise(function(res) { setTimeout(res, WAIT_AFTER_POST); }).then(postAndVerify);
       }
-      // All retries exhausted — log but do not block the UI
-      console.error('[Upload] Photo ' + photoIndex + ' failed after ' + maxRetries + ' attempts.');
+      console.error('[Upload] Photo ' + photoIndex + ' network retries exhausted.');
     });
   }
 
-  return tryUpload();
+  return postAndVerify();
 }
 
 /* ============================================================

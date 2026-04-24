@@ -613,6 +613,37 @@ body{
 .btn-new:hover{background:var(--accent-dim);}
 .canvas-hidden{display:none;}
 .divider{height:1px;background:var(--border);margin:14px 0;}
+
+/* ── SESSION POC BADGE ── */
+.session-badge{
+  display:none;
+  align-items:center;gap:10px;
+  background:rgba(233,223,67,.1);
+  border:1.5px solid rgba(233,223,67,.35);
+  border-radius:var(--r-sm);
+  padding:9px 14px;
+  margin-bottom:14px;
+}
+.session-badge.visible{display:flex;}
+.session-badge-icon{font-size:1.1rem;flex-shrink:0;}
+.session-badge-body{flex:1;min-width:0;}
+.session-badge-label{
+  font-family:'JetBrains Mono',monospace;
+  font-size:.6rem;letter-spacing:2px;
+  color:rgba(255,255,255,.5);text-transform:uppercase;
+  margin-bottom:2px;
+}
+.session-badge-values{
+  font-family:'Rajdhani',sans-serif;font-weight:700;
+  font-size:.95rem;color:var(--accent);letter-spacing:.5px;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+}
+.session-badge-tag{
+  font-family:'JetBrains Mono',monospace;font-size:.6rem;
+  color:#1a1a00;background:var(--accent);
+  border-radius:3px;padding:2px 7px;letter-spacing:1px;
+  flex-shrink:0;
+}
 /* ── BLUR WARNING POPUP ── */
 #blurPopup{
   display:none;position:fixed;inset:0;z-index:10001;
@@ -738,6 +769,16 @@ body{
       <!-- ── LEFT: DATA ENTRY ── -->
       <div class="panel">
         <span class="panel-title">&#128203; SHIPMENT DATA ENTRY</span>
+
+        <!-- Session POC badge — visible on 2nd+ submissions for whitelisted users -->
+        <div class="session-badge" id="sessionBadge">
+          <span class="session-badge-icon">&#128100;</span>
+          <div class="session-badge-body">
+            <div class="session-badge-label">SESSION — AUTO-FILLED</div>
+            <div class="session-badge-values" id="sessionBadgeValues"></div>
+          </div>
+          <span class="session-badge-tag">RETAINED</span>
+        </div>
 
         <!-- POC Name -->
         <div class="field-group">
@@ -944,6 +985,53 @@ var CREDS_SHEET_ID  = '1139mNsQJRa2QFAJvgY2MMVm9QbozDjYI93tO8gPpyNc';
 var loggedInUser     = null;
 var _credsCache      = null;   // cached credentials after first load
 
+/* ── Session POC retention ──
+   Users in SESSION_USER_IDS get POC Name + POC ID auto-filled
+   across form resets within the same login session.
+   Cleared completely on logout.                               */
+var _sessionPoc = null;   // { pocName: '', pocId: '' } or null
+var SESSION_USER_IDS = ['SURAT.DC', 'BANGALORE.DC', 'MASTER.ME'];
+
+function _isSessionUser() {
+  return loggedInUser &&
+         SESSION_USER_IDS.some(function(id) {
+           return id.toUpperCase() === loggedInUser.toUpperCase();
+         });
+}
+
+function _saveSessionPoc() {
+  if (!_isSessionUser()) return;
+  var name = document.getElementById('fPoc').value.trim();
+  var id   = document.getElementById('fPocId').value.trim();
+  if (name || id) {
+    _sessionPoc = { pocName: name, pocId: id };
+  }
+}
+
+function _restoreSessionPoc() {
+  if (!_isSessionUser() || !_sessionPoc) return;
+  var pocEl   = document.getElementById('fPoc');
+  var pocIdEl = document.getElementById('fPocId');
+  pocEl.value   = _sessionPoc.pocName || '';
+  pocIdEl.value = _sessionPoc.pocId   || '';
+  if (pocEl.value)   pocEl.classList.add('filled');
+  if (pocIdEl.value) pocIdEl.classList.add('filled');
+  _updateSessionBadge();
+  onFieldChange();  // recalculate readiness bar with restored values
+}
+
+function _updateSessionBadge() {
+  var badge = document.getElementById('sessionBadge');
+  var vals  = document.getElementById('sessionBadgeValues');
+  if (!badge || !vals) return;
+  if (_isSessionUser() && _sessionPoc && (_sessionPoc.pocName || _sessionPoc.pocId)) {
+    vals.textContent = (_sessionPoc.pocName || '—') + '  ·  ID: ' + (_sessionPoc.pocId || '—');
+    badge.classList.add('visible');
+  } else {
+    badge.classList.remove('visible');
+  }
+}
+
 /* ============================================================
    LOGIN — reads credentials directly from Google Sheet via
    the gviz/tq CSV endpoint. No Apps Script deployment needed.
@@ -981,6 +1069,8 @@ function doLogin() {
       if (match) {
         errEl.classList.remove('show');
         loggedInUser = uid.toUpperCase();
+        _sessionPoc  = null;           // fresh session — no carry-over from previous login
+        _updateSessionBadge();
         document.getElementById('loginPage').style.display = 'none';
         document.getElementById('appPage').style.display   = 'block';
       } else {
@@ -1055,8 +1145,11 @@ function _showLoginError(el, msg) {
 }
 
 function doLogout() {
+  _sessionPoc  = null;   // ← clear session on logout — never carries to next login
   loggedInUser = null;
   resetAll();
+  var badge = document.getElementById('sessionBadge');
+  if (badge) badge.classList.remove('visible');
   document.getElementById('appPage').style.display   = 'none';
   document.getElementById('loginPage').style.display = 'flex';
   document.getElementById('loginUserId').value    = '';
@@ -1715,8 +1808,13 @@ function handleSubmit() {
 function showSubmitPopup() { document.getElementById('submitPopup').classList.add('show'); }
 function closePopupAndReset() {
   document.getElementById('submitPopup').classList.remove('show');
+  _saveSessionPoc();   // capture POC Name + ID BEFORE resetAll clears the fields
   resetAll();
-  showToast('success','Ready','Form reset for next entry.');
+  if (_isSessionUser() && _sessionPoc) {
+    showToast('success', 'Ready', 'POC Name & ID retained. Fill remaining fields.');
+  } else {
+    showToast('success', 'Ready', 'Form reset for next entry.');
+  }
 }
 
 function resetAll() {
@@ -1727,6 +1825,8 @@ function resetAll() {
     var el=document.getElementById(id);
     el.value=''; el.classList.remove('filled');
   });
+  // Restore POC Name + ID for whitelisted session users AFTER clearing
+  _restoreSessionPoc();
   document.querySelectorAll('input[name="flyerType"]').forEach(function(r){r.checked=false;});
   document.querySelectorAll('.radio-option').forEach(function(l){l.classList.remove('selected');});
 

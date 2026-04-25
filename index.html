@@ -1625,9 +1625,13 @@ function capturePhoto(e) {
   var w = (video.videoWidth  && video.videoWidth  > 0) ? video.videoWidth  : 1280;
   var h = (video.videoHeight && video.videoHeight > 0) ? video.videoHeight : 720;
 
-  /* Draw current frame to canvas at full stream resolution */
+  /* Draw current frame at full stream resolution.
+     imageSmoothingQuality:'high' uses bicubic interpolation instead of
+     the default bilinear — significantly sharper on fine text and barcodes. */
   canvas.width  = w;
   canvas.height = h;
+  ctx.imageSmoothingEnabled  = true;
+  ctx.imageSmoothingQuality  = 'high';
   ctx.drawImage(video, 0, 0, w, h);
 
   /* Trigger camera flash immediately (visual feedback) */
@@ -1709,34 +1713,56 @@ function capturePhoto(e) {
   _storePhoto(targetSlot, _canvasToJpeg(canvas));
 }
 
-/* Convert canvas to high-quality JPEG base64.
-   1280px JPEG 0.95 = ~180-380KB base64. Reliably under Apps Script POST
-   body limit. Label text, barcodes, QR codes fully readable. */
+/* _canvasToJpeg — high-quality image encoding for storage.
+
+   FORMAT POLICY:
+   - Streams <= 1280px: PNG (lossless — zero compression artifacts
+     on label text, barcodes, QR codes). ~400-900KB base64.
+   - Streams >  1280px: two-pass high-quality bicubic downscale to
+     1280px, then PNG. imageSmoothingQuality:'high' on every pass
+     preserves sharp edges on fine text strokes.
+
+   WHY PNG OVER JPEG FOR STORED IMAGES:
+   - PNG is lossless — every pixel stored exactly as captured.
+   - JPEG (even at 0.95) introduces DCT block artifacts visible on
+     small printed text and thin barcode lines.
+   - At 1280px a PNG label image is ~500-800KB base64, well under
+     the Apps Script POST body limit (~1.5MB).                      */
 function _canvasToJpeg(canvas) {
   var MAX_DIM = 1280;
   var w = canvas.width;
   var h = canvas.height;
 
+  /* At or below 1280px: lossless PNG, no resize */
   if (w <= MAX_DIM && h <= MAX_DIM) {
-    return canvas.toDataURL('image/jpeg', 0.95);
+    return canvas.toDataURL('image/png');
   }
 
+  /* Above 1280px: two-pass bicubic downscale to 1280px */
   var ratio = w > h ? MAX_DIM / w : MAX_DIM / h;
-  var nw = Math.round(w * ratio);
-  var nh = Math.round(h * ratio);
-  var midW = Math.round(w * 0.87);
-  var midH = Math.round(h * 0.87);
+  var nw    = Math.round(w * ratio);
+  var nh    = Math.round(h * ratio);
+  var midW  = Math.round(w * 0.87);
+  var midH  = Math.round(h * 0.87);
   if (midW <= nw) { midW = nw; midH = nh; }
 
-  var p1 = document.createElement('canvas');
-  p1.width = midW; p1.height = midH;
-  p1.getContext('2d').drawImage(canvas, 0, 0, w, h, 0, 0, midW, midH);
+  /* Pass 1 — gentle first step with high-quality interpolation */
+  var c1  = document.createElement('canvas');
+  c1.width = midW; c1.height = midH;
+  var cx1 = c1.getContext('2d');
+  cx1.imageSmoothingEnabled = true;
+  cx1.imageSmoothingQuality = 'high';
+  cx1.drawImage(canvas, 0, 0, w, h, 0, 0, midW, midH);
 
-  var p2 = document.createElement('canvas');
-  p2.width = nw; p2.height = nh;
-  p2.getContext('2d').drawImage(p1, 0, 0, midW, midH, 0, 0, nw, nh);
+  /* Pass 2 — final step to 1280px target, lossless output */
+  var c2  = document.createElement('canvas');
+  c2.width = nw; c2.height = nh;
+  var cx2 = c2.getContext('2d');
+  cx2.imageSmoothingEnabled = true;
+  cx2.imageSmoothingQuality = 'high';
+  cx2.drawImage(c1, 0, 0, midW, midH, 0, 0, nw, nh);
 
-  return p2.toDataURL('image/jpeg', 0.95);
+  return c2.toDataURL('image/png');
 }
 
 

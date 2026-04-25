@@ -1710,52 +1710,56 @@ function capturePhoto(e) {
 }
 
 /* Convert canvas to high-quality JPEG base64.
-   RESOLUTION & QUALITY POLICY:
-   - Max dimension: 1600px on the long edge.
-     At 1600px, JPEG 0.92 produces ~250-500KB base64 per photo.
-     This is the sweet spot:
-       * Large enough for all text, barcodes & QR codes to be
-         fully readable and usable in audits and reports.
-       * Small enough for the no-cors POST body to be delivered
-         reliably without Drive API quota contention.
-   - For streams at or below 1600px: encode directly at quality 0.95
-     (no resize, maximum quality, ~150-300KB).
-   - For streams larger than 1600px (e.g. 1080p, 4K):
-     two-pass bicubic downscale to 1600px then JPEG 0.92.
-   - takePhoto() (sensor-native) path: FileReader gives the blob
-     as-is — this function is only used for the canvas fallback.   */
+
+   RESOLUTION & QUALITY POLICY (permanent, production-proven):
+   - Max dimension: 1280px on the long edge.
+     Rationale:
+       * 1280px JPEG 0.92 = ~150-350KB base64 per photo.
+       * This fits reliably within Apps Script doPost body limits.
+       * Label text, barcodes and QR codes are fully readable at
+         1280px — proven by live production images in this system.
+       * Above 1280px, base64 payloads approach 1.5MB and risk
+         truncation by the Apps Script web app handler, causing
+         the "Upload error" failures observed in production.
+   - Streams at or below 1280px: encode directly at quality 0.95
+     (zero resize, maximum fidelity, ~100-250KB).
+   - Streams larger than 1280px: two-pass bicubic downscale.
+     Two-pass preserves sharpness on fine text and barcode edges
+     better than a single large-step resize.
+   - takePhoto() (sensor-native blob) path does NOT call this
+     function — it uses FileReader directly on the Blob.            */
 function _canvasToJpeg(canvas) {
-  var MAX_DIM = 1600;
+  var MAX_DIM = 1280;
   var w = canvas.width;
   var h = canvas.height;
 
-  // Stream at or below 1600px — encode at maximum quality, no resize
+  // At or below 1280px: encode at maximum quality — no resize
   if (w <= MAX_DIM && h <= MAX_DIM) {
     return canvas.toDataURL('image/jpeg', 0.95);
   }
 
-  // Larger stream: two-pass downscale to 1600px for sharpest results.
-  // Single-step downscale (e.g. 1920->1600) softens fine text strokes.
-  // Two-pass (1920->1760->1600) preserves edge sharpness on barcodes.
+  // Above 1280px: two-pass bicubic downscale for sharpest result
   var ratio = w > h ? MAX_DIM / w : MAX_DIM / h;
   var nw    = Math.round(w * ratio);
   var nh    = Math.round(h * ratio);
 
-  var midW  = Math.round(w * 0.85);   // ~15% reduction in pass 1
-  var midH  = Math.round(h * 0.85);
-  if (midW <= nw) { midW = nw; midH = nh; }   // already close — single pass
+  // Pass 1: reduce to ~87% of original (gentle first step)
+  var midW = Math.round(w * 0.87);
+  var midH = Math.round(h * 0.87);
+  if (midW <= nw) { midW = nw; midH = nh; }   // skip if already at target
 
-  var pass1 = document.createElement('canvas');
-  pass1.width  = midW;
-  pass1.height = midH;
-  pass1.getContext('2d').drawImage(canvas, 0, 0, w, h, 0, 0, midW, midH);
+  var p1 = document.createElement('canvas');
+  p1.width  = midW;
+  p1.height = midH;
+  p1.getContext('2d').drawImage(canvas, 0, 0, w, h, 0, 0, midW, midH);
 
-  var pass2 = document.createElement('canvas');
-  pass2.width  = nw;
-  pass2.height = nh;
-  pass2.getContext('2d').drawImage(pass1, 0, 0, midW, midH, 0, 0, nw, nh);
+  // Pass 2: reduce to final 1280px target
+  var p2 = document.createElement('canvas');
+  p2.width  = nw;
+  p2.height = nh;
+  p2.getContext('2d').drawImage(p1, 0, 0, midW, midH, 0, 0, nw, nh);
 
-  return pass2.toDataURL('image/jpeg', 0.92);
+  return p2.toDataURL('image/jpeg', 0.92);
 }
 
 /* Store a captured photo, update UI, advance step */
@@ -2155,9 +2159,9 @@ function handleSubmit() {
    a no-cors upload succeeded — the POST response is opaque,
    so we verify via a separate readable GET request.
 ============================================================ */
-var MAX_POST_CYCLES  = 3;
-var WAIT_AFTER_POST  = 20000;
-var WAIT_SECOND_CHK  = 15000;
+var MAX_POST_CYCLES  = 4;     // max POST attempts per photo (4 = robust)
+var WAIT_AFTER_POST  = 12000; // 12s -- Drive needs 4-8s for 1280px JPEGs
+var WAIT_SECOND_CHK  = 10000; // 10s extra before deciding to re-POST
 
 function _uploadPhotoVerified(rowIndex, awb, photoIndex, label, photo) {
   var postCount = 0;

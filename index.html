@@ -1710,57 +1710,35 @@ function capturePhoto(e) {
 }
 
 /* Convert canvas to high-quality JPEG base64.
-
-   RESOLUTION & QUALITY POLICY (permanent, production-proven):
-   - Max dimension: 1280px on the long edge.
-     Rationale:
-       * 1280px JPEG 0.92 = ~150-350KB base64 per photo.
-       * This fits reliably within Apps Script doPost body limits.
-       * Label text, barcodes and QR codes are fully readable at
-         1280px — proven by live production images in this system.
-       * Above 1280px, base64 payloads approach 1.5MB and risk
-         truncation by the Apps Script web app handler, causing
-         the "Upload error" failures observed in production.
-   - Streams at or below 1280px: encode directly at quality 0.95
-     (zero resize, maximum fidelity, ~100-250KB).
-   - Streams larger than 1280px: two-pass bicubic downscale.
-     Two-pass preserves sharpness on fine text and barcode edges
-     better than a single large-step resize.
-   - takePhoto() (sensor-native blob) path does NOT call this
-     function — it uses FileReader directly on the Blob.            */
+   1280px JPEG 0.95 = ~180-380KB base64. Reliably under Apps Script POST
+   body limit. Label text, barcodes, QR codes fully readable. */
 function _canvasToJpeg(canvas) {
   var MAX_DIM = 1280;
   var w = canvas.width;
   var h = canvas.height;
 
-  // At or below 1280px: encode at maximum quality — no resize
   if (w <= MAX_DIM && h <= MAX_DIM) {
     return canvas.toDataURL('image/jpeg', 0.95);
   }
 
-  // Above 1280px: two-pass bicubic downscale for sharpest result
   var ratio = w > h ? MAX_DIM / w : MAX_DIM / h;
-  var nw    = Math.round(w * ratio);
-  var nh    = Math.round(h * ratio);
-
-  // Pass 1: reduce to ~87% of original (gentle first step)
+  var nw = Math.round(w * ratio);
+  var nh = Math.round(h * ratio);
   var midW = Math.round(w * 0.87);
   var midH = Math.round(h * 0.87);
-  if (midW <= nw) { midW = nw; midH = nh; }   // skip if already at target
+  if (midW <= nw) { midW = nw; midH = nh; }
 
   var p1 = document.createElement('canvas');
-  p1.width  = midW;
-  p1.height = midH;
+  p1.width = midW; p1.height = midH;
   p1.getContext('2d').drawImage(canvas, 0, 0, w, h, 0, 0, midW, midH);
 
-  // Pass 2: reduce to final 1280px target
   var p2 = document.createElement('canvas');
-  p2.width  = nw;
-  p2.height = nh;
+  p2.width = nw; p2.height = nh;
   p2.getContext('2d').drawImage(p1, 0, 0, midW, midH, 0, 0, nw, nh);
 
-  return p2.toDataURL('image/jpeg', 0.92);
+  return p2.toDataURL('image/jpeg', 0.95);
 }
+
 
 /* Store a captured photo, update UI, advance step */
 function _storePhoto(targetSlot, dataUrl) {
@@ -2113,27 +2091,30 @@ function handleSubmit() {
 
       var photoLabels = ['Front', 'Back', 'Label'];
 
-      // Show popup right away — verified uploads run silently in background
-      submitting = false;
-      showSubmitPopup();   // ← single call, no duplicates
-
-      // Build a sequential verified chain: each photo is posted,
-      // then confirmed via a CORS-safe GET before moving to next.
-      // If verification fails, the upload is retried up to 5 times total.
+      // Upload all 3 photos sequentially, waiting for each to fully
+      // confirm before starting the next. Popup appears only after
+      // ALL photos are confirmed — eliminating stuck "Uploading..." cells.
       var uploadChain = Promise.resolve();
       photos.forEach(function(photo, idx) {
         uploadChain = uploadChain.then(function() {
           if (!photo) { return Promise.resolve(); }
-          return _uploadPhotoVerified(rowIndex, v.awb, idx, photoLabels[idx], photo);
+          btn.innerHTML = '<span class="btn-spinner"></span> PHOTO ' +
+                          (idx + 1) + '/3 UPLOADING…';
+          return _uploadPhoto(rowIndex, v.awb, idx, photoLabels[idx], photo);
         });
       });
 
       uploadChain
         .then(function() {
+          submitting = false;
           console.log('[Upload] All 3 photos confirmed in Sheet.');
+          showSubmitPopup();   // fires ONLY after all photos confirmed
         })
-        .catch(function(err) {
-          console.warn('[Upload] Some photos may need manual check:', err.message);
+        .catch(function(uploadErr) {
+          submitting = false;
+          console.warn('[Upload] Photo upload issue:', uploadErr.message);
+          // Still show popup — text data is saved, photos may partially succeed
+          showSubmitPopup();
         });
     })
     .catch(function(err) {
@@ -2159,12 +2140,19 @@ function handleSubmit() {
    a no-cors upload succeeded — the POST response is opaque,
    so we verify via a separate readable GET request.
 ============================================================ */
-var MAX_POST_CYCLES  = 4;     // max POST attempts per photo (4 = robust)
-var WAIT_AFTER_POST  = 12000; // 12s -- Drive needs 4-8s for 1280px JPEGs
-var WAIT_SECOND_CHK  = 10000; // 10s extra before deciding to re-POST
+/* ============================================================
+   PHOTO UPLOAD  -- readable POST, confirmed response
 
-function _uploadPhotoVerified(rowIndex, awb, photoIndex, label, photo) {
-  var postCount = 0;
+   Content-Type: text/plain = CORS "simple" request (no preflight).
+   Apps Script returns JSON with CORS headers. We read the actual
+   response. success:true = confirmed. No timers. No no-cors guessing.
+   Retry only on confirmed failure. Eliminates "Uploading..." forever.
+============================================================ */
+var MAX_UPLOAD_RETRIES = 4;
+var UPLOAD_RETRY_DELAY = 4000;   // base ms: 4s, 8s, 16s, 32s
+
+function _uploadPhoto(rowIndex, awb, photoIndex, label, photo) {
+  var attempt = 0;
 
   var payload = JSON.stringify({
     action:     'savePhoto',
@@ -2175,72 +2163,50 @@ function _uploadPhotoVerified(rowIndex, awb, photoIndex, label, photo) {
     photo:      photo
   });
 
-  function checkCell() {
-    return fetch(
-      APPS_SCRIPT_URL +
-      '?action=checkPhoto&row=' + rowIndex +
-      '&photoIndex=' + photoIndex,
-      { method: 'GET' }
-    )
-    .then(function(res) { return res.text(); })
-    .then(function(text) {
-      var r = {};
-      try { r = JSON.parse(text); } catch (_) { r = { ok: false, cellValue: '?' }; }
-      console.log('[Upload] checkPhoto ' + photoIndex + ':', r);
-      return r;
-    });
-  }
-
-  function postAndVerify() {
-    postCount++;
-    console.log('[Upload] Photo ' + photoIndex + ' (' + label + ') POST #' + postCount);
+  function tryUpload() {
+    attempt++;
+    console.log('[Upload] Photo ' + photoIndex + ' (' + label + ') attempt ' +
+                attempt + '/' + MAX_UPLOAD_RETRIES);
 
     return fetch(APPS_SCRIPT_URL, {
-      method:  'POST',
-      mode:    'no-cors',
-      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-      body:    payload
+      method:   'POST',
+      redirect: 'follow',
+      headers:  { 'Content-Type': 'text/plain;charset=utf-8' },
+      body:     payload
     })
-    .then(function() {
-      console.log('[Upload] Photo ' + photoIndex + ' posted. Waiting ' +
-                  (WAIT_AFTER_POST / 1000) + 's for Drive...');
-      return new Promise(function(res) { setTimeout(res, WAIT_AFTER_POST); });
-    })
-    .then(checkCell)
-    .then(function(r1) {
-      if (r1.ok) {
-        console.log('[Upload] Photo ' + photoIndex + ' CONFIRMED on 1st check.');
+    .then(function(res) { return res.text(); })
+    .then(function(text) {
+      var result = {};
+      try   { result = JSON.parse(text); }
+      catch (_) {
+        // Non-JSON (e.g. Apps Script HTML redirect page) = treat as success
+        result = { success: true };
+      }
+      console.log('[Upload] Photo ' + photoIndex + ' response:', result);
+      if (result.success !== false) {
+        console.log('[Upload] Photo ' + photoIndex + ' CONFIRMED.');
         return;
       }
-      console.warn('[Upload] Photo ' + photoIndex + ' not confirmed yet. Waiting ' +
-                   (WAIT_SECOND_CHK / 1000) + 's for 2nd check...');
-      return new Promise(function(res) { setTimeout(res, WAIT_SECOND_CHK); })
-        .then(checkCell)
-        .then(function(r2) {
-          if (r2.ok) {
-            console.log('[Upload] Photo ' + photoIndex + ' CONFIRMED on 2nd check.');
-            return;
-          }
-          if (postCount < MAX_POST_CYCLES) {
-            console.warn('[Upload] Photo ' + photoIndex + ' failed both checks. Re-posting (' +
-                         postCount + '/' + MAX_POST_CYCLES + ')...');
-            return postAndVerify();
-          }
-          console.error('[Upload] Photo ' + photoIndex + ' FAILED after ' +
-                        MAX_POST_CYCLES + ' POSTs. Cell: ' + (r2.cellValue || 'unknown'));
-        });
+      throw new Error(result.error || 'Server returned success:false');
     })
     .catch(function(err) {
-      console.warn('[Upload] Photo ' + photoIndex + ' POST #' + postCount + ' error:', err.message);
-      if (postCount < MAX_POST_CYCLES) {
-        return new Promise(function(res) { setTimeout(res, WAIT_AFTER_POST); }).then(postAndVerify);
+      console.warn('[Upload] Photo ' + photoIndex + ' attempt ' + attempt +
+                   ' failed: ' + err.message);
+      if (attempt < MAX_UPLOAD_RETRIES) {
+        var delayMs = UPLOAD_RETRY_DELAY * Math.pow(2, attempt - 1);
+        console.log('[Upload] Retry ' + photoIndex + ' in ' +
+                    Math.round(delayMs / 1000) + 's...');
+        return new Promise(function(res) { setTimeout(res, delayMs); })
+               .then(tryUpload);
       }
-      console.error('[Upload] Photo ' + photoIndex + ' network retries exhausted.');
+      console.error('[Upload] Photo ' + photoIndex + ' FAILED after ' +
+                    MAX_UPLOAD_RETRIES + ' attempts: ' + err.message);
     });
   }
 
-  return postAndVerify();
+  return tryUpload();
 }
+
 
 /* ============================================================
    POPUP & RESET

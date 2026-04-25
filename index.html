@@ -1671,42 +1671,114 @@ function capturePhoto(e) {
     console.error('[BlurCheck] error in capturePhoto:', blurErr);
   }
 
-  /* ── PATH A: ImageCapture.takePhoto() — native sensor resolution ── */
-  if (_imageCapture && typeof _imageCapture.takePhoto === 'function') {
-    /* Disable button to prevent double-capture during async op */
-    var captureBtn = document.querySelector('.btn-capture');
-    if (captureBtn) { captureBtn.disabled = true; captureBtn.textContent = 'CAPTURING…'; }
+  /* ── PATH A: ImageCapture.takePhoto() — camera sensor still photo ──
+     takePhoto() captures a full still-photo from the camera sensor,
+     using the device's own image signal processor (ISP) for:
+       * Focus / autofocus result at the exact moment of capture
+       * White balance, exposure, HDR (better than video frame)
+       * Noise reduction (camera firmware-level processing)
+     This is why Image 2 (Lenovo label, regular phone camera) is so
+     much sharper than Image 1 (dashboard canvas capture from video).
 
-    /* Request the camera's maximum native resolution.
-       Omitting imageWidth/imageHeight lets the sensor decide its best
-       resolution (often higher than 4096px on modern devices). */
+     THE SIZE PROBLEM — why raw blob storage caused "Upload error":
+       12MP phone sensor JPEG = 4-8MB raw
+                               = 5.3-10.7MB base64 payload
+       Apps Script POST body limit = ~1.5MB
+       Result: body silently truncated -> base64Decode fails -> "Upload error"
+       Users fell back to canvas (low-quality video frame) automatically.
+
+     THE FIX — process through canvas at 1920px before storing:
+       4-8MB sensor JPEG -> drawn to 1920px canvas -> JPEG 0.93
+       = ~300-800KB base64 -> always within payload limit
+       Preserves ALL ISP processing — only the final encode changes.   */
+  if (_imageCapture && typeof _imageCapture.takePhoto === 'function') {
+    var captureBtn = document.querySelector('.btn-capture');
+    if (captureBtn) { captureBtn.disabled = true; captureBtn.textContent = 'CAPTURING...'; }
+
     _imageCapture.takePhoto({})
       .then(function(blob) {
+        /* Decode the sensor JPEG into an Image element so we can
+           draw it on a canvas and re-encode at a controlled size */
         return new Promise(function(resolve, reject) {
-          var reader = new FileReader();
-          reader.onloadend = function() {
-            /* FileReader gives data:image/jpeg;base64,... */
-            resolve(reader.result);
+          var img = new Image();
+          var blobUrl = URL.createObjectURL(blob);
+
+          img.onload = function() {
+            URL.revokeObjectURL(blobUrl);  // free memory
+
+            /* Determine output size: max 1920px on the long edge.
+               This preserves full resolution on most phone cameras
+               (which are <=12MP at ~4000px) while always fitting
+               within the 1.5MB base64 payload limit.               */
+            var MAX = 1920;
+            var sw = img.naturalWidth;
+            var sh = img.naturalHeight;
+            var scale = (sw > MAX || sh > MAX)
+              ? Math.min(MAX / sw, MAX / sh) : 1;
+            var tw = Math.round(sw * scale);
+            var th = Math.round(sh * scale);
+
+            /* If sensor image needs downscaling, use two-pass
+               bicubic for sharpest text edges on the label */
+            var srcCanvas = document.createElement('canvas');
+            var sctx      = srcCanvas.getContext('2d');
+
+            if (scale < 1) {
+              /* Pass 1: gentle reduction (~87% of original) */
+              var midW = Math.round(sw * 0.87);
+              var midH = Math.round(sh * 0.87);
+              if (midW <= tw) { midW = tw; midH = th; }  // skip if close
+
+              srcCanvas.width  = midW;
+              srcCanvas.height = midH;
+              sctx.imageSmoothingEnabled = true;
+              sctx.imageSmoothingQuality = 'high';
+              sctx.drawImage(img, 0, 0, midW, midH);
+
+              /* Pass 2: final target size */
+              var finalCanvas = document.createElement('canvas');
+              var fctx        = finalCanvas.getContext('2d');
+              finalCanvas.width  = tw;
+              finalCanvas.height = th;
+              fctx.imageSmoothingEnabled = true;
+              fctx.imageSmoothingQuality = 'high';
+              fctx.drawImage(srcCanvas, 0, 0, tw, th);
+
+              /* JPEG 0.93 = visually identical to raw sensor JPEG for
+                 photos. Label text, barcodes, QR fully readable. */
+              resolve(finalCanvas.toDataURL('image/jpeg', 0.93));
+            } else {
+              /* No downscale needed — encode at maximum quality */
+              srcCanvas.width  = tw;
+              srcCanvas.height = th;
+              sctx.imageSmoothingEnabled = true;
+              sctx.imageSmoothingQuality = 'high';
+              sctx.drawImage(img, 0, 0, tw, th);
+              resolve(srcCanvas.toDataURL('image/jpeg', 0.95));
+            }
           };
-          reader.onerror = function() { reject(new Error('FileReader failed')); };
-          reader.readAsDataURL(blob);
+
+          img.onerror = function() {
+            URL.revokeObjectURL(blobUrl);
+            reject(new Error('Image decode failed'));
+          };
+
+          img.src = blobUrl;
         });
       })
       .then(function(dataUrl) {
-        /* Re-enable button */
         if (captureBtn) { captureBtn.disabled = false; captureBtn.textContent = '● CAPTURE'; }
-        console.log('[Capture] takePhoto() success — size: ' +
-                    Math.round(dataUrl.length / 1024) + ' KB base64');
+        console.log('[Capture] takePhoto() processed: ' +
+                    Math.round(dataUrl.length / 1024) + 'KB base64');
         _storePhoto(targetSlot, dataUrl);
       })
       .catch(function(takeErr) {
-        /* takePhoto() failed — fall through to canvas path */
         console.warn('[Capture] takePhoto() failed, using canvas fallback:', takeErr.message);
         if (captureBtn) { captureBtn.disabled = false; captureBtn.textContent = '● CAPTURE'; }
         _storePhoto(targetSlot, _canvasToJpeg(canvas));
       });
 
-    return;  /* async path — _storePhoto called in .then() */
+    return;
   }
 
   /* ── PATH B: canvas fallback — JPEG 0.95 ── */

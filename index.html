@@ -1285,20 +1285,17 @@ function stageClicked(evt) {
 }
 
 function startCamera() {
-  // Level-1: request max resolution + continuous AF
-  // min:1280 forces the browser to use HD — without min, many browsers silently
-  // serve 640×480 even when ideal:4096 is set.
+  // Level-1: Full-HD (1920x1080) -- best webcam resolution
   var c1 = {
     video: {
-      facingMode: 'environment',
-      width:  { min: 1280, ideal: 4096 },
-      height: { min: 720,  ideal: 4096 },
-      frameRate: { ideal: 30 }
+      width:     { ideal: 1920 },
+      height:    { ideal: 1080 },
+      frameRate: { ideal: 30, max: 30 }
     }
   };
-  // Level-2: HD without framerate constraint
-  var c2 = { video: { facingMode: 'environment', width: { min: 1280 }, height: { min: 720 } } };
-  // Level-3: any rear camera
+  // Level-2: HD 1280x720 -- standard webcam fallback
+  var c2 = { video: { width: { ideal: 1280 }, height: { ideal: 720 } } };
+  // Level-3: any rear camera (mobile)
   var c3 = { video: { facingMode: 'environment' } };
   // Level-4: any camera
   var c4 = { video: true };
@@ -1787,30 +1784,28 @@ function capturePhoto(e) {
 
 /* _canvasToJpeg — high-quality image encoding for storage.
 
-   FORMAT POLICY:
-   - Streams <= 1280px: PNG (lossless — zero compression artifacts
-     on label text, barcodes, QR codes). ~400-900KB base64.
-   - Streams >  1280px: two-pass high-quality bicubic downscale to
-     1280px, then PNG. imageSmoothingQuality:'high' on every pass
-     preserves sharp edges on fine text strokes.
-
-   WHY PNG OVER JPEG FOR STORED IMAGES:
-   - PNG is lossless — every pixel stored exactly as captured.
-   - JPEG (even at 0.95) introduces DCT block artifacts visible on
-     small printed text and thin barcode lines.
-   - At 1280px a PNG label image is ~500-800KB base64, well under
-     the Apps Script POST body limit (~1.5MB).                      */
+   FORMAT POLICY (webcam-optimised):
+   - JPEG 0.95 throughout (not PNG).
+   - Webcam streams are already 720p or 1080p — PNG of a video frame
+     offers no quality advantage over JPEG 0.95 because the source
+     pixels are already JPEG-compressed by the video codec. PNG only
+     adds file size without improving sharpness.
+   - JPEG 0.95 at 1280px = ~200-500KB base64, always within the
+     Apps Script POST body limit (~1.5MB). PNG at 1080p = 3-8MB.
+   - No resize for streams <= 1920px (webcam max).
+   - For streams > 1920px (rare): two-pass bicubic to 1920px.
+   - imageSmoothingQuality:'high' on all draw operations.            */
 function _canvasToJpeg(canvas) {
-  var MAX_DIM = 1280;
+  var MAX_DIM = 1920;   // webcam max — no unnecessary downscale
   var w = canvas.width;
   var h = canvas.height;
 
-  /* At or below 1280px: lossless PNG, no resize */
+  /* At or below 1920px: JPEG 0.95 directly — no resize, max quality */
   if (w <= MAX_DIM && h <= MAX_DIM) {
-    return canvas.toDataURL('image/png');
+    return canvas.toDataURL('image/jpeg', 0.95);
   }
 
-  /* Above 1280px: two-pass bicubic downscale to 1280px */
+  /* Above 1920px (phone camera fallback): two-pass bicubic to 1920px */
   var ratio = w > h ? MAX_DIM / w : MAX_DIM / h;
   var nw    = Math.round(w * ratio);
   var nh    = Math.round(h * ratio);
@@ -1818,7 +1813,6 @@ function _canvasToJpeg(canvas) {
   var midH  = Math.round(h * 0.87);
   if (midW <= nw) { midW = nw; midH = nh; }
 
-  /* Pass 1 — gentle first step with high-quality interpolation */
   var c1  = document.createElement('canvas');
   c1.width = midW; c1.height = midH;
   var cx1 = c1.getContext('2d');
@@ -1826,7 +1820,6 @@ function _canvasToJpeg(canvas) {
   cx1.imageSmoothingQuality = 'high';
   cx1.drawImage(canvas, 0, 0, w, h, 0, 0, midW, midH);
 
-  /* Pass 2 — final step to 1280px target, lossless output */
   var c2  = document.createElement('canvas');
   c2.width = nw; c2.height = nh;
   var cx2 = c2.getContext('2d');
@@ -1834,7 +1827,7 @@ function _canvasToJpeg(canvas) {
   cx2.imageSmoothingQuality = 'high';
   cx2.drawImage(c1, 0, 0, midW, midH, 0, 0, nw, nh);
 
-  return c2.toDataURL('image/png');
+  return c2.toDataURL('image/jpeg', 0.95);
 }
 
 
@@ -2189,30 +2182,27 @@ function handleSubmit() {
 
       var photoLabels = ['Front', 'Back', 'Label'];
 
-      // Upload all 3 photos sequentially, waiting for each to fully
-      // confirm before starting the next. Popup appears only after
-      // ALL photos are confirmed — eliminating stuck "Uploading..." cells.
-      var uploadChain = Promise.resolve();
-      photos.forEach(function(photo, idx) {
-        uploadChain = uploadChain.then(function() {
-          if (!photo) { return Promise.resolve(); }
-          btn.innerHTML = '<span class="btn-spinner"></span> PHOTO ' +
-                          (idx + 1) + '/3 UPLOADING…';
-          return _uploadPhoto(rowIndex, v.awb, idx, photoLabels[idx], photo);
-        });
+      /* ── STEP 2: show popup immediately, upload photos in parallel ──
+         Text row is confirmed saved. UI feedback is instant (<2s).
+         All 3 photos upload simultaneously in background — Drive API
+         handles 3 concurrent requests without rate-limit issues at
+         this payload size (1280px JPEG ~300-700KB each).
+         Sequential waiting was the cause of the ~1 minute delay.     */
+      submitting = false;
+      showSubmitPopup();   // instant — text data already saved
+
+      /* Parallel upload: Promise.all fires all 3 at once */
+      var photoPromises = photos.map(function(photo, idx) {
+        if (!photo) { return Promise.resolve(); }
+        return _uploadPhoto(rowIndex, v.awb, idx, photoLabels[idx], photo);
       });
 
-      uploadChain
+      Promise.all(photoPromises)
         .then(function() {
-          submitting = false;
           console.log('[Upload] All 3 photos confirmed in Sheet.');
-          showSubmitPopup();   // fires ONLY after all photos confirmed
         })
         .catch(function(uploadErr) {
-          submitting = false;
-          console.warn('[Upload] Photo upload issue:', uploadErr.message);
-          // Still show popup — text data is saved, photos may partially succeed
-          showSubmitPopup();
+          console.warn('[Upload] One or more photos had an issue:', uploadErr.message);
         });
     })
     .catch(function(err) {

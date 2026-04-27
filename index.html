@@ -1335,11 +1335,16 @@ function attachStream(s) {
       _focusSupported = !!(caps.focusMode || caps.pointsOfInterest);
       console.log('[AF] ImageCapture ready. Hardware AF supported:', _focusSupported);
 
-      /* Request continuous AF immediately when hardware supports it */
-      if (_focusSupported) {
-        videoTrack.applyConstraints({ advanced: [{ focusMode: 'continuous' }] })
-          .then(function() { console.log('[AF] Continuous AF engaged.'); })
-          .catch(function(err) { console.warn('[AF] Continuous AF not available:', err.message); });
+      /* Request continuous AF + exposure correction for warehouse lights */
+      var advConstraints = [];
+      if (_focusSupported) { advConstraints.push({ focusMode: 'continuous' }); }
+      advConstraints.push({ exposureMode: 'continuous' });
+      advConstraints.push({ whiteBalanceMode: 'continuous' });
+
+      if (advConstraints.length > 0) {
+        videoTrack.applyConstraints({ advanced: advConstraints })
+          .then(function() { console.log('[AF] Continuous AF + exposure engaged.'); })
+          .catch(function(err) { console.warn('[AF] Advanced constraints (non-fatal):', err.message); });
       }
     }
   } catch (capErr) {
@@ -1449,6 +1454,114 @@ function _applyFocus(normX, normY) {
 function _hideFocusRing() {
   var ring = document.getElementById('focusRing');
   if (ring) { ring.className = 'focus-ring'; }
+}
+
+/* ============================================================
+   STABILITY DETECTION + LABEL FOCUS HELPERS
+============================================================ */
+
+/**
+ * Wait for the camera frame to stabilise (no hand motion/shake),
+ * then fire the callback. Uses a 80x60 analysis canvas for speed.
+ *
+ * If the frame is already stable, fires after `minDelayMs`.
+ * If not stable within 1.5s, fires anyway (timeout).
+ *
+ * @param {number}   minDelayMs  Minimum wait before capture (0-300ms)
+ * @param {function} callback    Called when stable or timed out
+ */
+function _waitForStableFrame(minDelayMs, callback) {
+  var video = document.getElementById('videoFeed');
+  if (!video || !stream) {
+    setTimeout(callback, minDelayMs);
+    return;
+  }
+
+  var AW = 80, AH = 60;            // small analysis canvas for speed
+  var THRESHOLD = 12;              // avg pixel diff = motion threshold
+  var MAX_WAIT  = 1500;            // max wait before forcing capture
+  var CHECK_MS  = 100;             // interval between checks
+  var elapsed   = 0;
+  var prevData  = null;
+
+  var analysisCvs = document.createElement('canvas');
+  analysisCvs.width  = AW;
+  analysisCvs.height = AH;
+  var actx = analysisCvs.getContext('2d');
+
+  function check() {
+    try {
+      actx.drawImage(video, 0, 0, AW, AH);
+      var curr = actx.getImageData(0, 0, AW, AH).data;
+
+      if (prevData) {
+        var diffSum = 0;
+        var n = 0;
+        for (var i = 0; i < curr.length; i += 4) {
+          diffSum += Math.abs(curr[i]   - prevData[i])
+                   + Math.abs(curr[i+1] - prevData[i+1])
+                   + Math.abs(curr[i+2] - prevData[i+2]);
+          n++;
+        }
+        var avgDiff = diffSum / n;
+
+        if (avgDiff < THRESHOLD) {
+          console.log('[Stability] Frame stable (diff=' + avgDiff.toFixed(1) + ')');
+          callback();
+          return;
+        }
+        console.log('[Stability] Motion detected (diff=' + avgDiff.toFixed(1) + '), waiting...');
+      }
+
+      prevData = curr;
+    } catch (err) {
+      // Canvas taint or video not ready — proceed immediately
+      callback();
+      return;
+    }
+
+    elapsed += CHECK_MS;
+    if (elapsed < MAX_WAIT) {
+      setTimeout(check, CHECK_MS);
+    } else {
+      console.log('[Stability] Timeout — capturing anyway.');
+      callback();
+    }
+  }
+
+  /* Always respect the minimum delay first */
+  setTimeout(check, Math.max(minDelayMs, CHECK_MS));
+}
+
+/**
+ * For LABEL slot: apply a centre-point focus hint.
+ * Shows the focus ring in the centre of the preview and nudges the
+ * camera's autofocus toward the centre (where the label is held).
+ * The 300ms delay in capturePhoto gives AF time to respond.
+ */
+function _applyLabelFocusHint() {
+  var ring  = document.getElementById('focusRing');
+  var stage = document.getElementById('photoStage');
+  if (!ring || !stage) return;
+
+  /* Show focus ring at centre of the preview */
+  var r    = stage.getBoundingClientRect();
+  var cx   = r.width  / 2;
+  var cy   = r.height / 2;
+
+  ring.style.left = cx + 'px';
+  ring.style.top  = cy + 'px';
+  ring.className  = 'focus-ring show';
+  void ring.offsetWidth;
+  if (_focusTimer) clearTimeout(_focusTimer);
+  _focusTimer = setTimeout(function() { ring.classList.add('locked'); }, 400);
+
+  /* Apply hardware focus point to centre (label distance ~30-50cm) */
+  _applyFocus(0.5, 0.5);
+
+  /* Update hint bar */
+  var hintBar = document.getElementById('focusHintBar');
+  if (hintBar) { hintBar.textContent = 'FOCUSING ON LABEL...'; }
 }
 
 /* ============================================================
@@ -1614,22 +1727,70 @@ function capturePhoto(e) {
   for(var i=0;i<3;i++){ if(photos[i]===null){targetSlot=i;break;} }
   if(targetSlot===-1) return;
 
+  /* ── LABEL SLOT (slot 2) special pre-capture handling ──────────
+     The label is small and close to the camera. Two problems occur:
+     1. Autofocus locks on background (ceiling, people), not label.
+     2. Label occupies only ~25% of the frame — low pixel density.
+     Fix:
+     a) Force focus to the centre of frame (where label is held)
+        and wait 300ms for AF to settle on the label distance.
+     b) After capture, apply 1.5x centre-crop zoom to the canvas,
+        increasing effective pixel density on the label by ~50%.  */
+  var isLabelSlot = (targetSlot === 2);
+  var captureDelay = isLabelSlot ? 300 : 0;  // extra settling time for label
+
+  if (isLabelSlot) {
+    /* Nudge autofocus to centre (label plane), show centre focus ring */
+    _applyLabelFocusHint();
+  }
+
+  /* Always wait for frame to stabilise (motion blur prevention).
+     Uses frame-difference analysis on a fast 80x60 sample.       */
+  _waitForStableFrame(captureDelay, function() {
+    _doCapture(targetSlot, isLabelSlot);
+  });
+}
+
+function _doCapture(targetSlot, isLabelSlot) {
   var video  = document.getElementById('videoFeed');
   var canvas = document.getElementById('captureCanvas');
   var ctx    = canvas.getContext('2d');
 
-  /* Wait for video to have actual resolution data */
+  /* Capture at full stream resolution */
   var w = (video.videoWidth  && video.videoWidth  > 0) ? video.videoWidth  : 1280;
   var h = (video.videoHeight && video.videoHeight > 0) ? video.videoHeight : 720;
 
-  /* Draw current frame at full stream resolution.
-     imageSmoothingQuality:'high' uses bicubic interpolation instead of
-     the default bilinear — significantly sharper on fine text and barcodes. */
   canvas.width  = w;
   canvas.height = h;
-  ctx.imageSmoothingEnabled  = true;
-  ctx.imageSmoothingQuality  = 'high';
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = 'high';
   ctx.drawImage(video, 0, 0, w, h);
+
+  /* For LABEL slot: apply 1.5x centre-crop zoom.
+     Crops the centre 67% of the frame and scales it back to full
+     canvas size, increasing label pixel density by ~1.5x.
+     A warehouse label typically occupies the centre third of the
+     frame — this crop captures it at much higher effective resolution. */
+  if (isLabelSlot) {
+    var CROP = 0.67;   // keep centre 67% of frame
+    var cx   = Math.round(w * (1 - CROP) / 2);
+    var cy   = Math.round(h * (1 - CROP) / 2);
+    var cw   = Math.round(w * CROP);
+    var ch   = Math.round(h * CROP);
+
+    /* Draw cropped region back to the full canvas (zoom effect) */
+    var tmpCanvas = document.createElement('canvas');
+    tmpCanvas.width  = w;
+    tmpCanvas.height = h;
+    var tmpCtx = tmpCanvas.getContext('2d');
+    tmpCtx.imageSmoothingEnabled = true;
+    tmpCtx.imageSmoothingQuality = 'high';
+    tmpCtx.drawImage(canvas, cx, cy, cw, ch, 0, 0, w, h);
+
+    /* Replace the main canvas with the zoomed version */
+    ctx.clearRect(0, 0, w, h);
+    ctx.drawImage(tmpCanvas, 0, 0);
+  }
 
   /* Trigger camera flash immediately (visual feedback) */
   var flashEl = document.getElementById('flashOverlay');
